@@ -1,8 +1,15 @@
 """
-Code Edit Feature - Self-modification capabilities for Kestrel agents.
+Code Feature - Source-code reading + modification capabilities for Kestrel agents.
 
-This feature enables agents to modify their own source code with proper
-constitutional controls and approval workflows.
+This feature exposes a code tool surface (read, search, diff, lint, test,
+logs, edit, commit, rollback, restart) with constitutional approval gating
+on the destructive operations. All @tool methods return
+``kestrel_sdk.tools.result.ToolResult`` per the kestrel-sovereign #1042
+narration-honesty contract.
+
+Renamed from ``CodeEditFeature`` in v0.2.0 — the surface is broader than
+just edits. The old class name is kept as a deprecated alias for v0.2.x
+and removed in v0.3.0.
 """
 import asyncio
 import functools
@@ -15,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +59,18 @@ async def _write_text(path: Path, content: str) -> int:
     return await asyncio.to_thread(path.write_text, content, encoding="utf-8")
 
 
-def _search_file_contents(code_root: Path, resolved: Path, pattern: str, file_pattern: str) -> tuple[list[dict], int]:
-    """Search files synchronously for offloading via asyncio.to_thread."""
+def _search_file_contents(
+    code_root: Path,
+    resolved: Path,
+    pattern: str,
+    file_pattern: str,
+) -> tuple[list[dict], int]:
+    """Search files synchronously for offloading via asyncio.to_thread.
+
+    Returns ``(matches[:50], total_matches)``. Caller MUST surface
+    ``total_matches`` so the LLM doesn't claim ``found 50 matches``
+    when there are 200 (#1042 honesty contract).
+    """
     matches = []
     total_matches = 0
 
@@ -61,7 +79,7 @@ def _search_file_contents(code_root: Path, resolved: Path, pattern: str, file_pa
             continue
         try:
             content = file_path.read_text(encoding="utf-8")
-            for i, line in enumerate(content.split('\n'), 1):
+            for i, line in enumerate(content.split("\n"), 1):
                 if pattern in line:
                     total_matches += 1
                     if len(matches) < 50:
@@ -76,180 +94,135 @@ def _search_file_contents(code_root: Path, resolved: Path, pattern: str, file_pa
     return matches, total_matches
 
 
-class CodeEditFeature(Feature):
-    """Feature for self-modification of source code.
-    
-    Enables the agent to:
-    - Read its own source files
-    - Edit source files (with approval)
-    - Commit changes to git
-    - Signal for server restart
-    
-    All destructive operations require user approval via SecurityFeature.
+class CodeFeature(Feature):
+    """Feature for reading and modifying source code with approval gates.
+
+    Renamed from ``CodeEditFeature`` in v0.2.0 — the surface is broader
+    than just edits (read, search, diff, lint, test, logs, commit,
+    rollback, restart). All mutation paths require user approval via
+    SecurityFeature.
     """
-    
-    tool_name = "code_edit"
+
+    tool_name = "code"
     tool_description = "Read and modify the agent's own source code with approval"
-    
+
     def __init__(self, agent=None, code_root: str = None):
-        """Initialize the code edit feature.
-        
-        Args:
-            agent: The parent agent instance
-            code_root: Root directory of the codebase (default: auto-detect)
-        """
         super().__init__(agent)
         self.code_root = Path(code_root or DEFAULT_CODE_ROOT).resolve()
         self._pending_restart = False
-    
+
     async def initialize(self):
-        """Initialize the feature."""
-        logger.info(f"CodeEditFeature initialized with root: {self.code_root}")
-    
+        logger.info(f"CodeFeature initialized with root: {self.code_root}")
+
     def _resolve_path(self, path: str) -> Path:
-        """Resolve a path relative to code root, with security checks."""
-        # Handle absolute paths by making them relative
+        """Resolve a path relative to code root, with security checks.
+
+        Raises ``ValueError`` only on the path-escape security check;
+        every @tool method that calls this MUST catch ValueError and
+        convert to ``ToolResult.failed`` so the security violation
+        lands in the envelope, not as a raised exception.
+        """
         if path.startswith("/"):
             path = path.lstrip("/")
-        
         resolved = (self.code_root / path).resolve()
-        
-        # Security: ensure path is within code root
         if not str(resolved).startswith(str(self.code_root)):
             raise ValueError(f"Path escapes code root: {path}")
-        
         return resolved
-    
+
     def _get_security_feature(self):
-        """Get the security feature for approval requests."""
-        if hasattr(self.agent, 'get_feature'):
+        if hasattr(self.agent, "get_feature"):
             return self.agent.get_feature("security")
-        elif hasattr(self.agent, 'features'):
+        if hasattr(self.agent, "features"):
             return self.agent.features.get("security")
         return None
-    
+
     async def _request_approval(self, action: str, details: Dict[str, Any]) -> bool:
-        """Request approval for a code modification.
-        
-        Args:
-            action: The action being requested (e.g., "code_edit")
-            details: Details about the modification
-            
-        Returns:
-            True if approved, False otherwise
-        """
         security = self._get_security_feature()
-        
-        if not security or not hasattr(security, 'approval_queue'):
+        if not security or not hasattr(security, "approval_queue"):
             logger.warning("SecurityFeature not available, cannot proceed with code edit")
             return False
-        
         try:
-            approved, scope = await security.approval_queue.request_approval(
-                feature_name="code_edit",
+            approved, _ = await security.approval_queue.request_approval(
+                feature_name="code",
                 tool_name=action,
                 tool_args=details,
                 timeout=CODE_REVIEW_TIMEOUT,
             )
             return approved
-        except (TimeoutError, asyncio.TimeoutError) as e:
-            logger.error(f"Approval request timed out: {e}")
-            return False
-        except (AttributeError, TypeError, ValueError) as e:
-            logger.error(f"Approval request failed due to invalid arguments: {e}")
-            return False
         except Exception as e:
             logger.error(f"Approval request failed: {e}", exc_info=True)
             return False
-    
+
     # ============== Read Operations (No Approval Required) ==============
-    
+
     @tool(
         name="code_read",
         description="Read a source file from the agent's codebase.",
         category=ToolCategory.DATA_ACCESS,
-        command_prefix="!code-read"
+        command_prefix="!code-read",
     )
     async def code_read(
         self,
         path: str,
         start_line: int = None,
         end_line: int = None,
-    ) -> Dict[str, Any]:
-        """Read a source file.
-        
-        Args:
-            path: Path to file relative to code root
-            start_line: Optional start line (1-indexed)
-            end_line: Optional end line (1-indexed)
-            
-        Returns:
-            Dict with file content and metadata
-        """
+    ) -> ToolResult:
         try:
             resolved = self._resolve_path(path)
-            
-            if not resolved.exists():
-                return {"success": False, "error": f"File not found: {path}"}
-            
-            if not resolved.is_file():
-                return {"success": False, "error": f"Not a file: {path}"}
-            
+        except ValueError as e:
+            return ToolResult.failed(str(e), data={"path": path})
+        if not resolved.exists():
+            return ToolResult.failed(f"File not found: {path}", data={"path": path})
+        if not resolved.is_file():
+            return ToolResult.failed(f"Not a file: {path}", data={"path": path})
+        try:
             content = await _read_text(resolved)
-            lines = content.split('\n')
-            
-            # Handle line range
-            if start_line or end_line:
-                start_idx = (start_line - 1) if start_line else 0
-                end_idx = end_line if end_line else len(lines)
-                lines = lines[start_idx:end_idx]
-                content = '\n'.join(lines)
-            
-            return {
-                "success": True,
-                "path": str(resolved.relative_to(self.code_root)),
-                "content": content,
-                "total_lines": len(content.split('\n')),
-                "shown_lines": len(lines),
-            }
-        except (FileNotFoundError, PermissionError, OSError) as e:
-            logger.error(f"Error reading file: {e}")
-            return {"success": False, "error": str(e)}
-        except (UnicodeDecodeError, ValueError) as e:
-            logger.error(f"Error decoding file content: {e}")
-            return {"success": False, "error": str(e)}
         except Exception as e:
-            logger.error(f"Error reading file: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
+            return ToolResult.failed(str(e), data={"path": path})
+
+        # ``splitlines()`` correctly handles trailing newlines —
+        # ``"line1\nline2\n".splitlines()`` is ``["line1", "line2"]``
+        # (2 lines), not the 3-element list ``split("\n")`` produces.
+        all_lines = content.splitlines()
+        if start_line or end_line:
+            start_idx = (start_line - 1) if start_line else 0
+            end_idx = end_line if end_line else len(all_lines)
+            shown = all_lines[start_idx:end_idx]
+            content = "\n".join(shown)
+        else:
+            shown = all_lines
+
+        rel = str(resolved.relative_to(self.code_root))
+        return ToolResult.ok(
+            confirmation=f"Read {len(shown)} line(s) from {rel}",
+            data={
+                "path": rel,
+                "content": content,
+                "total_lines": len(all_lines),
+                "shown_lines": len(shown),
+            },
+        )
+
     @tool(
         name="code_search",
         description="Search for text in the agent's codebase.",
         category=ToolCategory.DATA_ACCESS,
-        command_prefix="!code-search"
+        command_prefix="!code-search",
     )
     async def code_search(
         self,
         pattern: str,
         path: str = ".",
         file_pattern: str = "*.py",
-    ) -> Dict[str, Any]:
-        """Search for text in source files.
-        
-        Args:
-            pattern: Text pattern to search for
-            path: Directory to search in (relative to code root)
-            file_pattern: Glob pattern for files to search
-            
-        Returns:
-            Dict with matching files and lines
-        """
+    ) -> ToolResult:
         try:
             resolved = self._resolve_path(path)
-            
-            if not resolved.exists():
-                return {"success": False, "error": f"Path not found: {path}"}
-            
+        except ValueError as e:
+            return ToolResult.failed(str(e), data={"path": path})
+        if not resolved.exists():
+            return ToolResult.failed(f"Path not found: {path}", data={"path": path})
+
+        try:
             matches, total_matches = await asyncio.to_thread(
                 _search_file_contents,
                 self.code_root,
@@ -257,30 +230,34 @@ class CodeEditFeature(Feature):
                 pattern,
                 file_pattern,
             )
-            
-            return {
-                "success": True,
+        except Exception as e:
+            return ToolResult.failed(str(e), data={"pattern": pattern, "path": path})
+
+        # Surface BOTH the truncated match list AND the real total
+        # so the LLM can't lie about the result count (#1042).
+        truncated = total_matches > len(matches)
+        confirmation = (
+            f"Found {total_matches} match(es) for '{pattern}'"
+            if not truncated
+            else f"Found {total_matches} match(es) for '{pattern}' (showing first {len(matches)})"
+        )
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data={
                 "pattern": pattern,
                 "matches": matches,
                 "total_matches": total_matches,
-            }
-        except (FileNotFoundError, PermissionError, OSError) as e:
-            logger.error(f"Error searching: {e}")
-            return {"success": False, "error": str(e)}
-        except ValueError as e:
-            logger.error(f"Invalid search parameters: {e}")
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.error(f"Error searching: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
+                "truncated": truncated,
+            },
+        )
+
     # ============== Write Operations (Require Approval) ==============
-    
+
     @tool(
         name="code_edit",
         description="Edit a source file by replacing exact text. Requires approval.",
         category=ToolCategory.SYSTEM,
-        command_prefix="!code-edit"
+        command_prefix="!code-edit",
     )
     async def code_edit(
         self,
@@ -288,100 +265,93 @@ class CodeEditFeature(Feature):
         old_text: str,
         new_text: str,
         description: str = None,
-    ) -> Dict[str, Any]:
-        """Edit a source file by replacing exact text.
-        
-        This operation requires user approval. The old_text must match
-        exactly (including whitespace) and appear exactly once in the file.
-        
-        Args:
-            path: Path to file relative to code root
-            old_text: Exact text to find and replace
-            new_text: New text to replace with
-            description: Optional description of the change
-            
-        Returns:
-            Dict with success status and details
-        """
+    ) -> ToolResult:
         try:
             resolved = self._resolve_path(path)
-            
-            if not resolved.exists():
-                return {"success": False, "error": f"File not found: {path}"}
-            
+        except ValueError as e:
+            return ToolResult.failed(str(e), data={"path": path})
+        if not resolved.exists():
+            return ToolResult.failed(f"File not found: {path}", data={"path": path})
+
+        try:
             content = await _read_text(resolved)
-            
-            # Verify old_text exists exactly once
-            count = content.count(old_text)
-            if count == 0:
-                return {
-                    "success": False,
-                    "error": "Text to replace not found in file",
-                    "hint": "Ensure old_text matches exactly, including whitespace"
-                }
-            if count > 1:
-                return {
-                    "success": False,
-                    "error": f"Text appears {count} times, must be unique",
-                    "hint": "Add more context to make the match unique"
-                }
-            
-            # Request approval
-            approved = await self._request_approval("code_edit", {
-                "path": path,
-                "old_text": old_text[:500] + ("..." if len(old_text) > 500 else ""),
-                "new_text": new_text[:500] + ("..." if len(new_text) > 500 else ""),
-                "description": description or "Code modification",
-            })
-            
-            if not approved:
-                return {
-                    "success": False,
-                    "error": "Edit not approved",
-                    "requires_approval": True,
-                }
-            
-            # Apply the edit
+        except Exception as e:
+            return ToolResult.failed(str(e), data={"path": path})
+
+        count = content.count(old_text)
+        if count == 0:
+            return ToolResult.failed(
+                "Text to replace not found in file",
+                data={
+                    "path": path,
+                    "hint": "Ensure old_text matches exactly, including whitespace",
+                },
+            )
+        if count > 1:
+            return ToolResult.failed(
+                f"Text appears {count} times, must be unique",
+                data={
+                    "path": path,
+                    "occurrences": count,
+                    "hint": "Add more context to make the match unique",
+                },
+            )
+
+        try:
+            approved = await self._request_approval(
+                "code_edit",
+                {
+                    "path": path,
+                    "old_text": old_text[:500] + ("..." if len(old_text) > 500 else ""),
+                    "new_text": new_text[:500] + ("..." if len(new_text) > 500 else ""),
+                    "description": description or "Code modification",
+                },
+            )
+        except Exception as e:
+            return ToolResult.failed(
+                f"Approval check failed: {e}",
+                data={"path": path, "requires_approval": True},
+            )
+
+        if not approved:
+            return ToolResult.failed(
+                "Edit not approved",
+                data={"path": path, "requires_approval": True},
+            )
+
+        try:
             new_content = content.replace(old_text, new_text, 1)
             await _write_text(resolved, new_content)
-            
-            logger.info(f"Applied code edit to {path}: {description or 'no description'}")
-            
-            return {
-                "success": True,
-                "path": str(resolved.relative_to(self.code_root)),
+        except Exception as e:
+            return ToolResult.failed(
+                f"Approved edit failed during write: {e}",
+                data={"path": path, "warning": "approval granted but write failed"},
+            )
+
+        rel = str(resolved.relative_to(self.code_root))
+        logger.info(f"Applied code edit to {rel}: {description or 'no description'}")
+        return ToolResult.ok(
+            confirmation=f"Edited {rel}",
+            data={
+                "path": rel,
                 "description": description,
                 "chars_removed": len(old_text),
                 "chars_added": len(new_text),
-            }
-        except (FileNotFoundError, PermissionError, OSError) as e:
-            logger.error(f"Error editing file: {e}")
-            return {"success": False, "error": str(e)}
-        except (UnicodeDecodeError, ValueError) as e:
-            logger.error(f"Error processing file content: {e}")
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.error(f"Error editing file: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
+            },
+        )
+
     @tool(
         name="code_diff",
         description="Show uncommitted git changes in the codebase.",
         category=ToolCategory.DATA_ACCESS,
-        command_prefix="!code-diff"
+        command_prefix="!code-diff",
     )
-    async def code_diff(self, path: str = ".") -> Dict[str, Any]:
-        """Show uncommitted changes.
-        
-        Args:
-            path: Path to check (relative to code root, default: all)
-            
-        Returns:
-            Dict with diff output
-        """
+    async def code_diff(self, path: str = ".") -> ToolResult:
         try:
             resolved = self._resolve_path(path)
-            
+        except ValueError as e:
+            return ToolResult.failed(str(e), data={"path": path})
+        try:
             result = await _run_subprocess(
                 [GIT_PATH, "diff", str(resolved)],
                 cwd=self.code_root,
@@ -389,70 +359,93 @@ class CodeEditFeature(Feature):
                 text=True,
                 timeout=GIT_OPERATION_TIMEOUT,
             )
-            
-            if result.returncode != 0:
-                return {"success": False, "error": result.stderr}
-            
-            return {
-                "success": True,
-                "diff": result.stdout or "(no changes)",
-                "has_changes": bool(result.stdout.strip()),
-            }
-        except subprocess.TimeoutExpired as e:
-            logger.error(f"Git diff timed out: {e}")
-            return {"success": False, "error": "Git diff operation timed out"}
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
-            logger.error(f"Error getting diff: {e}")
-            return {"success": False, "error": str(e)}
+        except subprocess.TimeoutExpired:
+            return ToolResult.failed(
+                "Git diff operation timed out",
+                data={"path": path, "timeout_seconds": GIT_OPERATION_TIMEOUT},
+            )
         except Exception as e:
-            logger.error(f"Error getting diff: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
+            return ToolResult.failed(str(e), data={"path": path})
+
+        if result.returncode != 0:
+            return ToolResult.failed(
+                result.stderr or "git diff returned non-zero",
+                data={"path": path, "returncode": result.returncode},
+            )
+
+        diff_text = result.stdout or ""
+        has_changes = bool(diff_text.strip())
+        confirmation = (
+            "No uncommitted changes"
+            if not has_changes
+            else f"Showing uncommitted diff for {path}"
+        )
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data={
+                "diff": diff_text or "(no changes)",
+                "has_changes": has_changes,
+                "path": path,
+            },
+        )
+
     @tool(
         name="code_commit",
         description="Commit staged changes to git. Requires approval.",
         category=ToolCategory.SYSTEM,
-        command_prefix="!code-commit"
+        command_prefix="!code-commit",
     )
     async def code_commit(
         self,
         message: str,
         files: str = ".",
-    ) -> Dict[str, Any]:
-        """Commit changes to git.
-        
-        Args:
-            message: Commit message
-            files: Files to commit (default: all changes)
-            
-        Returns:
-            Dict with commit details
-        """
+    ) -> ToolResult:
+        # Validate the path BEFORE asking for approval. If we already
+        # know the operation is structurally invalid, don't burn the
+        # user's attention on it.
         try:
-            # Request approval
-            approved = await self._request_approval("code_commit", {
-                "message": message,
-                "files": files,
-            })
-            
-            if not approved:
-                return {
-                    "success": False,
-                    "error": "Commit not approved",
-                    "requires_approval": True,
-                }
-            
             resolved = self._resolve_path(files)
-            
-            # Stage files
-            await _run_subprocess(
+        except ValueError as e:
+            return ToolResult.failed(str(e), data={"files": files})
+
+        try:
+            approved = await self._request_approval(
+                "code_commit",
+                {"message": message, "files": files},
+            )
+        except Exception as e:
+            return ToolResult.failed(
+                f"Approval check failed: {e}",
+                data={"requires_approval": True},
+            )
+        if not approved:
+            return ToolResult.failed(
+                "Commit not approved",
+                data={"requires_approval": True},
+            )
+
+        # Use capture_output so a failed `git add` lands in the
+        # envelope instead of raising CalledProcessError out of
+        # subprocess(check=True).
+        try:
+            add_result = await _run_subprocess(
                 [GIT_PATH, "add", str(resolved)],
                 cwd=self.code_root,
-                check=True,
+                capture_output=True,
+                text=True,
                 timeout=GIT_OPERATION_TIMEOUT,
             )
-            
-            # Commit
+        except subprocess.TimeoutExpired:
+            return ToolResult.failed("Git add operation timed out")
+        except Exception as e:
+            return ToolResult.failed(str(e))
+        if add_result.returncode != 0:
+            return ToolResult.failed(
+                add_result.stderr or "git add failed",
+                data={"step": "add", "returncode": add_result.returncode},
+            )
+
+        try:
             result = await _run_subprocess(
                 [GIT_PATH, "commit", "-m", message],
                 cwd=self.code_root,
@@ -460,13 +453,28 @@ class CodeEditFeature(Feature):
                 text=True,
                 timeout=GIT_OPERATION_TIMEOUT,
             )
-            
-            if result.returncode != 0:
-                if "nothing to commit" in result.stdout:
-                    return {"success": True, "message": "Nothing to commit"}
-                return {"success": False, "error": result.stderr}
-            
-            # Get commit hash
+        except subprocess.TimeoutExpired:
+            return ToolResult.failed("Git commit operation timed out")
+        except Exception as e:
+            return ToolResult.failed(str(e))
+
+        if result.returncode != 0:
+            stdout_text = result.stdout or ""
+            stderr_text = result.stderr or ""
+            # ``git commit`` returns non-zero on "nothing to commit".
+            # That's a no-op, NOT a success that pretends a commit
+            # happened (#1042 honesty).
+            if "nothing to commit" in stdout_text or "nothing to commit" in stderr_text:
+                return ToolResult.ok(
+                    confirmation="Nothing to commit (no-op)",
+                    data={"committed": False, "message": message},
+                )
+            return ToolResult.failed(
+                stderr_text or "git commit failed",
+                data={"step": "commit", "returncode": result.returncode},
+            )
+
+        try:
             hash_result = await _run_subprocess(
                 [GIT_PATH, "rev-parse", "HEAD"],
                 cwd=self.code_root,
@@ -474,136 +482,141 @@ class CodeEditFeature(Feature):
                 text=True,
                 timeout=GIT_QUICK_TIMEOUT,
             )
-            
-            commit_hash = hash_result.stdout.strip()[:8]
-            
-            logger.info(f"Committed changes: {commit_hash} - {message}")
-            
-            return {
-                "success": True,
+        except subprocess.TimeoutExpired:
+            return ToolResult.partial(
+                confirmation="Committed (commit hash unavailable)",
+                error="git rev-parse HEAD timed out after the commit succeeded",
+                data={"committed": True, "message": message},
+            )
+        except Exception as e:
+            return ToolResult.partial(
+                confirmation="Committed (commit hash unavailable)",
+                error=f"git rev-parse failed after commit: {e}",
+                data={"committed": True, "message": message},
+            )
+
+        # rev-parse can also exit non-zero without raising (corrupted
+        # repo, detached refs). Check the returncode explicitly so
+        # an empty commit_hash doesn't become "Committed : message".
+        if hash_result.returncode != 0:
+            return ToolResult.partial(
+                confirmation="Committed (commit hash unavailable)",
+                error=(
+                    f"git rev-parse HEAD returned non-zero "
+                    f"({hash_result.returncode}) after the commit succeeded: "
+                    f"{hash_result.stderr or '(no stderr)'}"
+                ),
+                data={
+                    "committed": True,
+                    "message": message,
+                    "rev_parse_returncode": hash_result.returncode,
+                },
+            )
+
+        commit_hash = hash_result.stdout.strip()[:8]
+        logger.info(f"Committed changes: {commit_hash} - {message}")
+        return ToolResult.ok(
+            confirmation=f"Committed {commit_hash}: {message}",
+            data={
+                "committed": True,
                 "commit": commit_hash,
                 "message": message,
-            }
-        except subprocess.CalledProcessError as e:
-            return {"success": False, "error": str(e)}
-        except subprocess.TimeoutExpired as e:
-            logger.error(f"Git commit timed out: {e}")
-            return {"success": False, "error": "Git commit operation timed out"}
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
-            logger.error(f"Error committing: {e}")
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.error(f"Error committing: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
+            },
+        )
+
     @tool(
         name="code_restart",
         description="Signal that the server should restart to apply code changes.",
         category=ToolCategory.SYSTEM,
-        command_prefix="!code-restart"
+        command_prefix="!code-restart",
     )
-    async def code_restart(self, reason: str = None) -> Dict[str, Any]:
-        """Signal server restart.
-        
-        This sets a flag that can be checked by external process managers.
-        The actual restart is handled by the deployment infrastructure.
-        
-        Args:
-            reason: Optional reason for restart
-            
-        Returns:
-            Dict with restart status
-        """
+    async def code_restart(self, reason: str = None) -> ToolResult:
         try:
-            # Request approval
-            approved = await self._request_approval("code_restart", {
-                "reason": reason or "Apply code changes",
-            })
-            
-            if not approved:
-                return {
-                    "success": False,
-                    "error": "Restart not approved",
-                    "requires_approval": True,
-                }
-            
+            approved = await self._request_approval(
+                "code_restart",
+                {"reason": reason or "Apply code changes"},
+            )
+        except Exception as e:
+            return ToolResult.failed(
+                f"Approval check failed: {e}",
+                data={"requires_approval": True},
+            )
+        if not approved:
+            return ToolResult.failed(
+                "Restart not approved",
+                data={"requires_approval": True},
+            )
+
+        try:
             self._pending_restart = True
-            
-            # Write restart signal file
             restart_file = self.code_root / ".restart_requested"
             await _write_text(restart_file, reason or "Code changes applied")
-            
-            logger.info(f"Restart signaled: {reason}")
-            
-            return {
-                "success": True,
-                "message": "Restart signaled. Server will restart when possible.",
-                "reason": reason,
-            }
-        except (PermissionError, OSError) as e:
-            logger.error(f"Error signaling restart: {e}")
-            return {"success": False, "error": str(e)}
         except Exception as e:
-            logger.error(f"Error signaling restart: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
+            return ToolResult.partial(
+                confirmation="Restart approved (in-memory flag set)",
+                error=f"could not write .restart_requested: {e}",
+                data={
+                    "pending_restart": True,
+                    "warning": "external process managers may not see the signal",
+                },
+            )
+
+        logger.info(f"Restart signaled: {reason}")
+        return ToolResult.ok(
+            confirmation="Restart signaled. Server will restart when possible.",
+            data={"pending_restart": True, "reason": reason},
+        )
+
     @property
     def pending_restart(self) -> bool:
-        """Check if a restart has been requested."""
         return self._pending_restart
-    
+
     # ============== Testing & Validation ==============
-    
+
     @tool(
         name="code_test",
         description="Run pytest tests on the codebase. Requires approval for full test suite.",
         category=ToolCategory.SYSTEM,
-        command_prefix="!code-test"
+        command_prefix="!code-test",
     )
     async def code_test(
         self,
         path: str = None,
         verbose: bool = False,
         fail_fast: bool = True,
-    ) -> Dict[str, Any]:
-        """Run pytest tests.
-        
-        Args:
-            path: Specific test file or directory (default: all tests)
-            verbose: Show verbose output
-            fail_fast: Stop on first failure
-            
-        Returns:
-            Dict with test results
-        """
-        try:
-            # Build pytest command
-            cmd = [PYTHON_PATH, "-m", "pytest"]
-            
-            if path:
+    ) -> ToolResult:
+        cmd = [PYTHON_PATH, "-m", "pytest"]
+
+        if path:
+            try:
                 resolved = self._resolve_path(path)
-                cmd.append(str(resolved))
-            else:
-                # Running full test suite requires approval
-                approved = await self._request_approval("code_test", {
-                    "scope": "full test suite",
-                    "reason": "Running all tests",
-                })
-                if not approved:
-                    return {
-                        "success": False,
-                        "error": "Full test suite requires approval",
-                        "requires_approval": True,
-                    }
-            
-            if verbose:
-                cmd.append("-v")
-            if fail_fast:
-                cmd.append("-x")
-            
-            # Add timeout and capture
-            cmd.extend(["--tb=short", "--no-header", "-q"])
-            
+            except ValueError as e:
+                return ToolResult.failed(str(e), data={"path": path})
+            cmd.append(str(resolved))
+        else:
+            try:
+                approved = await self._request_approval(
+                    "code_test",
+                    {"scope": "full test suite", "reason": "Running all tests"},
+                )
+            except Exception as e:
+                return ToolResult.failed(
+                    f"Approval check failed: {e}",
+                    data={"requires_approval": True},
+                )
+            if not approved:
+                return ToolResult.failed(
+                    "Full test suite requires approval",
+                    data={"requires_approval": True},
+                )
+
+        if verbose:
+            cmd.append("-v")
+        if fail_fast:
+            cmd.append("-x")
+        cmd.extend(["--tb=short", "--no-header", "-q"])
+
+        try:
             result = await _run_subprocess(
                 cmd,
                 cwd=self.code_root,
@@ -612,43 +625,47 @@ class CodeEditFeature(Feature):
                 timeout=TEST_SUITE_TIMEOUT,
                 env={**os.environ, "PYTHONPATH": str(self.code_root)},
             )
-            
-            passed = result.returncode == 0
-            
-            return {
-                "success": True,
-                "passed": passed,
-                "return_code": result.returncode,
-                "output": result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout,
-                "errors": result.stderr[-1000:] if result.stderr else None,
-            }
         except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Test timeout (5 minutes)"}
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
-            logger.error(f"Error running tests: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(
+                f"Test timeout ({TEST_SUITE_TIMEOUT}s)",
+                data={"path": path, "timeout_seconds": TEST_SUITE_TIMEOUT},
+            )
         except Exception as e:
-            logger.error(f"Error running tests: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
+            return ToolResult.failed(str(e), data={"path": path})
+
+        passed = result.returncode == 0
+        out = result.stdout or ""
+        err = result.stderr or ""
+        data = {
+            "passed": passed,
+            "return_code": result.returncode,
+            "output": out[-2000:] if len(out) > 2000 else out,
+            "errors": err[-1000:] if err else None,
+        }
+        # Status-level honesty: failed tests = PARTIAL, not OK. The
+        # tool ran correctly but the test run failed; audit hooks
+        # reading ``result.status`` need to see non-OK on failure.
+        if passed:
+            return ToolResult.ok(confirmation="Tests passed", data=data)
+        return ToolResult.partial(
+            confirmation=f"Tests FAILED (return code {result.returncode})",
+            error=f"pytest exited with non-zero return code {result.returncode}",
+            data=data,
+        )
+
     @tool(
         name="code_lint",
         description="Run linters (ruff) on source files.",
         category=ToolCategory.DATA_ACCESS,
-        command_prefix="!code-lint"
+        command_prefix="!code-lint",
     )
-    async def code_lint(self, path: str = ".") -> Dict[str, Any]:
-        """Run ruff linter on source files.
-        
-        Args:
-            path: Path to lint (default: all)
-            
-        Returns:
-            Dict with linting results
-        """
+    async def code_lint(self, path: str = ".") -> ToolResult:
         try:
             resolved = self._resolve_path(path)
-            
+        except ValueError as e:
+            return ToolResult.failed(str(e), data={"path": path})
+
+        try:
             result = await _run_subprocess(
                 [PYTHON_PATH, "-m", "ruff", "check", str(resolved), "--output-format=text"],
                 cwd=self.code_root,
@@ -657,135 +674,142 @@ class CodeEditFeature(Feature):
                 timeout=LINT_TIMEOUT,
                 env={**os.environ, "PYTHONPATH": str(self.code_root)},
             )
-            
-            has_issues = result.returncode != 0
-            
-            return {
-                "success": True,
-                "has_issues": has_issues,
-                "output": result.stdout[-2000:] if result.stdout else "(no issues)",
-                "issue_count": result.stdout.count("\n") if result.stdout else 0,
-            }
-        except subprocess.TimeoutExpired as e:
-            logger.error(f"Linting timed out: {e}")
-            return {"success": False, "error": "Linting operation timed out"}
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
-            logger.error(f"Error linting: {e}")
-            return {"success": False, "error": str(e)}
+        except subprocess.TimeoutExpired:
+            return ToolResult.failed(
+                "Linting operation timed out",
+                data={"path": path, "timeout_seconds": LINT_TIMEOUT},
+            )
         except Exception as e:
-            logger.error(f"Error linting: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
+            return ToolResult.failed(str(e), data={"path": path})
+
+        has_issues = result.returncode != 0
+        # Compute issue count from REAL stdout, not the display
+        # fallback. Otherwise non-zero exit + empty stdout would
+        # count the placeholder "(no issues)" string as 1 issue.
+        raw_stdout = result.stdout or ""
+        issue_lines = [l for l in raw_stdout.splitlines() if l.strip()]
+        issue_count = len(issue_lines) if has_issues else 0
+        out = raw_stdout if raw_stdout.strip() else "(no issues)"
+
+        confirmation = (
+            "Lint clean (no issues)"
+            if not has_issues
+            else f"Lint found {issue_count} issue line(s)"
+        )
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data={
+                "has_issues": has_issues,
+                "output": out[-2000:] if len(out) > 2000 else out,
+                "issue_count": issue_count,
+            },
+        )
+
     @tool(
         name="code_logs",
         description="View recent application logs.",
         category=ToolCategory.DATA_ACCESS,
-        command_prefix="!code-logs"
+        command_prefix="!code-logs",
     )
     async def code_logs(
         self,
         lines: int = 50,
         errors_only: bool = False,
         log_file: str = None,
-    ) -> Dict[str, Any]:
-        """View recent logs.
-        
-        Args:
-            lines: Number of lines to show
-            errors_only: Only show ERROR level logs
-            log_file: Specific log file (default: auto-detect)
-            
-        Returns:
-            Dict with log content
-        """
+    ) -> ToolResult:
+        # User-supplied ``log_file`` MUST go through _resolve_path —
+        # without it, a relative escape like ``../../../etc/passwd``
+        # would read outside the code-root sandbox.
+        user_path: Optional[Path] = None
+        if log_file is not None:
+            try:
+                user_path = self._resolve_path(log_file)
+            except ValueError as e:
+                return ToolResult.failed(str(e), data={"log_file": log_file})
+
+        log_paths: List[Optional[Path]] = [
+            user_path,
+            Path("/tmp/kestrel-claw.log"),
+            self.code_root / "logs" / "kestrel.log",
+            self.code_root / "kestrel.log",
+        ]
+
+        log_content: Optional[str] = None
+        used_path: Optional[str] = None
         try:
-            # Try common log locations
-            log_paths = [
-                log_file,
-                "/tmp/kestrel-claw.log",
-                self.code_root / "logs" / "kestrel.log",
-                self.code_root / "kestrel.log",
-            ]
-            
-            log_content = None
-            used_path = None
-            
-            for lp in log_paths:
-                if lp is None:
+            for p in log_paths:
+                if p is None:
                     continue
-                lp = Path(lp)
-                if lp.exists():
-                    log_content = await _read_text(lp)
-                    used_path = str(lp)
+                if p.exists():
+                    log_content = await _read_text(p)
+                    used_path = str(p)
                     break
-            
-            if log_content is None:
-                return {"success": False, "error": "No log file found"}
-            
-            # Get last N lines
-            log_lines = log_content.split('\n')
-            
-            if errors_only:
-                log_lines = [l for l in log_lines if 'ERROR' in l or 'CRITICAL' in l]
-            
-            recent = log_lines[-lines:]
-            
-            return {
-                "success": True,
-                "log_file": used_path,
-                "lines": len(recent),
-                "content": '\n'.join(recent),
-            }
-        except (FileNotFoundError, PermissionError, OSError) as e:
-            logger.error(f"Error reading logs: {e}")
-            return {"success": False, "error": str(e)}
-        except (UnicodeDecodeError, ValueError) as e:
-            logger.error(f"Error processing log content: {e}")
-            return {"success": False, "error": str(e)}
         except Exception as e:
-            logger.error(f"Error reading logs: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
+            return ToolResult.failed(str(e))
+
+        if log_content is None:
+            return ToolResult.failed(
+                "No log file found",
+                data={"searched": [str(p) for p in log_paths if p]},
+            )
+
+        log_lines = log_content.split("\n")
+        if errors_only:
+            log_lines = [l for l in log_lines if "ERROR" in l or "CRITICAL" in l]
+
+        recent = log_lines[-lines:]
+        # Phrase ``lines`` as the tail REQUEST, not a fabricated
+        # count. The actual count returned IS surfaced in data.
+        return ToolResult.ok(
+            confirmation=(
+                f"Retrieved logs (tail: {lines}, errors_only={errors_only})"
+            ),
+            data={
+                "log_file": used_path,
+                "lines_returned": len(recent),
+                "lines_requested": lines,
+                "errors_only": errors_only,
+                "content": "\n".join(recent),
+            },
+        )
+
     @tool(
         name="code_rollback",
         description="Rollback to a previous commit. Requires approval.",
         category=ToolCategory.SYSTEM,
-        command_prefix="!code-rollback"
+        command_prefix="!code-rollback",
     )
     async def code_rollback(
         self,
         commit: str = "HEAD~1",
         hard: bool = False,
-    ) -> Dict[str, Any]:
-        """Rollback to a previous commit.
-        
-        Args:
-            commit: Commit to rollback to (default: previous commit)
-            hard: Use --hard reset (discards all changes)
-            
-        Returns:
-            Dict with rollback status
-        """
+    ) -> ToolResult:
         try:
-            # Always require approval for rollback
-            approved = await self._request_approval("code_rollback", {
-                "commit": commit,
-                "hard": hard,
-                "warning": "This will modify git history",
-            })
-            
-            if not approved:
-                return {
-                    "success": False,
-                    "error": "Rollback not approved",
-                    "requires_approval": True,
-                }
-            
-            cmd = [GIT_PATH, "reset"]
-            if hard:
-                cmd.append("--hard")
-            cmd.append(commit)
-            
+            approved = await self._request_approval(
+                "code_rollback",
+                {
+                    "commit": commit,
+                    "hard": hard,
+                    "warning": "This will modify git history",
+                },
+            )
+        except Exception as e:
+            return ToolResult.failed(
+                f"Approval check failed: {e}",
+                data={"requires_approval": True},
+            )
+        if not approved:
+            return ToolResult.failed(
+                "Rollback not approved",
+                data={"requires_approval": True, "commit": commit, "hard": hard},
+            )
+
+        cmd = [GIT_PATH, "reset"]
+        if hard:
+            cmd.append("--hard")
+        cmd.append(commit)
+
+        try:
             result = await _run_subprocess(
                 cmd,
                 cwd=self.code_root,
@@ -793,23 +817,60 @@ class CodeEditFeature(Feature):
                 text=True,
                 timeout=GIT_OPERATION_TIMEOUT,
             )
-            
-            if result.returncode != 0:
-                return {"success": False, "error": result.stderr}
-            
-            logger.info(f"Rolled back to {commit}")
-            
-            return {
-                "success": True,
-                "message": f"Rolled back to {commit}",
-                "output": result.stdout,
-            }
-        except subprocess.TimeoutExpired as e:
-            logger.error(f"Git rollback timed out: {e}")
-            return {"success": False, "error": "Git rollback operation timed out"}
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
-            logger.error(f"Error rolling back: {e}")
-            return {"success": False, "error": str(e)}
+        except subprocess.TimeoutExpired:
+            return ToolResult.failed(
+                "Git rollback operation timed out",
+                data={"commit": commit, "hard": hard},
+            )
         except Exception as e:
-            logger.error(f"Error rolling back: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(
+                str(e), data={"commit": commit, "hard": hard}
+            )
+
+        if result.returncode != 0:
+            return ToolResult.failed(
+                result.stderr or "git reset failed",
+                data={
+                    "commit": commit,
+                    "hard": hard,
+                    "returncode": result.returncode,
+                },
+            )
+
+        logger.info(f"Rolled back to {commit}")
+        # Distinguish hard from soft because hard discards working-
+        # tree changes — narrating "rolled back" without that
+        # distinction is misleading.
+        confirmation = (
+            f"Hard-reset to {commit} (working tree changes discarded)"
+            if hard
+            else f"Rolled back to {commit}"
+        )
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data={
+                "commit": commit,
+                "hard": hard,
+                "output": result.stdout,
+            },
+        )
+
+
+# Backwards-compat alias for the v0.1.0 class name. Removed in v0.3.0.
+# Importing ``CodeEditFeature`` from this module emits a
+# DeprecationWarning so external callers learn to migrate before the
+# v0.3.0 cutover.
+def __getattr__(name: str):
+    if name == "CodeEditFeature":
+        import warnings
+        warnings.warn(
+            "CodeEditFeature is a deprecated alias for CodeFeature; "
+            "the alias will be removed in v0.3.0. Update imports to "
+            "``from kestrel_feature_code.feature import CodeFeature``.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return CodeFeature
+    raise AttributeError(
+        f"module 'kestrel_feature_code.feature' has no attribute {name!r}"
+    )

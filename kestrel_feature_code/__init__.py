@@ -1,15 +1,15 @@
 """
 Kestrel Feature Code — codebase tooling for Kestrel Sovereign agents.
 
-Extracted from kestrel-sovereign as a standalone feature package.
-Registers ``CodeEditFeature`` via the ``kestrel_sovereign.features``
-entry-point group; auto-discovered when installed alongside
-kestrel-sovereign.
+Registers ``CodeFeature`` (renamed from ``CodeEditFeature`` in
+v0.2.0) via the ``kestrel_sovereign.features`` entry-point group;
+auto-discovered when installed alongside kestrel-sovereign.
 
-Despite the historical class name, the feature covers general codebase
-tooling — read, search, diff, lint, logs, test — alongside the
-approval-gated mutation tools (edit, commit, rollback, restart). All
-mutation requires explicit user approval; read-only operations do not.
+The feature covers general codebase tooling — read, search, diff,
+lint, logs, test — alongside the approval-gated mutation tools (edit,
+commit, rollback, restart). All mutation requires explicit user
+approval; read-only operations do not. Returns
+``kestrel_sdk.tools.result.ToolResult`` from every @tool surface.
 
 Tools:
     !code-read <path>           Read a source file
@@ -26,11 +26,36 @@ Tools:
 
 from importlib.metadata import PackageNotFoundError, version as _version
 
-from .feature import CodeEditFeature
+from .feature import CodeFeature
 
 try:
     __version__ = _version("kestrel-feature-code")
 except PackageNotFoundError:
     __version__ = "0.0.0+local"
 
-__all__ = ["CodeEditFeature", "__version__"]
+__all__ = ["CodeFeature", "__version__"]
+
+
+def __getattr__(name: str):
+    """Lazy backward-compat for ``from kestrel_feature_code import
+    CodeEditFeature``. Removed in v0.3.0.
+
+    Emits the DeprecationWarning here directly (not via the
+    ``feature`` submodule's __getattr__) so the stacklevel points at
+    the user's import site. Going through the submodule alias would
+    add an extra frame and attribute the warning to ``__init__.py``
+    instead of the user's code.
+    """
+    if name == "CodeEditFeature":
+        import warnings
+        warnings.warn(
+            "CodeEditFeature is a deprecated alias for CodeFeature; "
+            "the alias will be removed in v0.3.0. Update imports to "
+            "``from kestrel_feature_code import CodeFeature``.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return CodeFeature
+    raise AttributeError(
+        f"module 'kestrel_feature_code' has no attribute {name!r}"
+    )
