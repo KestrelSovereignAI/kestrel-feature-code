@@ -798,6 +798,23 @@ async def test_code_edit_non_string_text_args_return_failed(feature):
 
 
 @pytest.mark.asyncio
+async def test_code_logs_zero_or_negative_lines_returns_failed(feature):
+    """Codex round-5 finding: ``log_lines[-0:]`` returns the FULL
+    log because ``-0 == 0`` in Python slicing, so the previous code
+    silently over-disclosed when lines=0 was passed. Now rejected.
+    Negative values would also return a non-tail slice."""
+    feat, root = feature
+    log = root / "kestrel.log"
+    log.write_text("a\nb\nc\n", encoding="utf-8")
+
+    for bad in [0, -1, -10]:
+        result = await feat.code_logs(lines=bad)
+        assert isinstance(result, ToolResult), bad
+        assert result.status is ToolResultStatus.ERROR, bad
+        assert "must be positive" in result.error.lower(), bad
+
+
+@pytest.mark.asyncio
 async def test_code_logs_non_int_lines_returns_failed(feature):
     """Codex round-3 finding #5: ``lines="ten"`` must not TypeError
     out of the slice."""

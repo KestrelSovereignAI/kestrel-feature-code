@@ -1014,6 +1014,15 @@ class CodeFeature(Feature):
             lines = self._coerce_required_int("lines", lines, default=50)
         except ValueError as e:
             return ToolResult.failed(str(e), data={"lines": lines})
+        # Reject ``lines <= 0`` — ``log_lines[-0:]`` returns the
+        # FULL log because ``-0 == 0`` in Python slicing, which
+        # would lie via the "tail: 0" confirmation while
+        # over-disclosing data (codex round-5 finding).
+        if lines <= 0:
+            return ToolResult.failed(
+                f"Invalid lines '{lines}': must be positive (got {lines})",
+                data={"lines": lines},
+            )
         if not isinstance(errors_only, bool):
             return ToolResult.failed(
                 f"Invalid errors_only: must be a bool, got "
