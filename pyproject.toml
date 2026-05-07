@@ -1,11 +1,48 @@
 [project]
 name = "kestrel-feature-code"
 version = "0.1.0"
-description = "Agent self-modification with constitutional approval for Kestrel Sovereign"
+description = "Codebase tooling feature for Kestrel Sovereign — read, search, edit, lint, test, commit, rollback with approval gates"
+readme = "README.md"
 requires-python = ">=3.11,<3.14"
-dependencies = [
-    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "UncleSaurus" }]
+maintainers = [{ name = "UncleSaurus" }]
+keywords = [
+    "ai",
+    "agents",
+    "kestrel",
+    "code-tools",
+    "self-modification",
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "kestrel-sovereign-sdk>=0.2,<1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
+]
+
+[project.urls]
+Homepage = "https://kestrelsovereign.com"
+Source = "https://github.com/KestrelSovereignAI/kestrel-feature-code"
+Issues = "https://github.com/KestrelSovereignAI/kestrel-feature-code/issues"
 
 [project.entry-points."kestrel_sovereign.features"]
 CodeEditFeature = "kestrel_feature_code.feature:CodeEditFeature"
@@ -14,8 +51,11 @@ CodeEditFeature = "kestrel_feature_code.feature:CodeEditFeature"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_feature_code"]
+
+[tool.hatch.build.targets.sdist]
+include = ["kestrel_feature_code/**/*", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

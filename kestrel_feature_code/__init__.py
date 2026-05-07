@@ -1,17 +1,15 @@
 """
-Kestrel Feature Code — Agent self-modification with constitutional approval.
+Kestrel Feature Code — codebase tooling for Kestrel Sovereign agents.
 
 Extracted from kestrel-sovereign as a standalone feature package.
+Registers ``CodeEditFeature`` via the ``kestrel_sovereign.features``
+entry-point group; auto-discovered when installed alongside
+kestrel-sovereign.
 
-Enables the Kestrel Agent to edit its own source code with proper
-security controls and approval flows. Sovereign-only: only agents that
-own their own codebase should use this feature.
-
-Key Principles:
-1. All code edits require explicit user approval
-2. Changes are tracked via git commits
-3. Edits use exact text matching (no regex) for safety
-4. Server restart can be signaled after changes
+Despite the historical class name, the feature covers general codebase
+tooling — read, search, diff, lint, logs, test — alongside the
+approval-gated mutation tools (edit, commit, rollback, restart). All
+mutation requires explicit user approval; read-only operations do not.
 
 Tools:
     !code-read <path>           Read a source file
@@ -26,6 +24,13 @@ Tools:
     !code-rollback [commit]     Rollback to previous commit (requires approval)
 """
 
+from importlib.metadata import PackageNotFoundError, version as _version
+
 from .feature import CodeEditFeature
 
-__all__ = ["CodeEditFeature"]
+try:
+    __version__ = _version("kestrel-feature-code")
+except PackageNotFoundError:
+    __version__ = "0.0.0+local"
+
+__all__ = ["CodeEditFeature", "__version__"]
