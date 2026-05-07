@@ -473,12 +473,23 @@ async def test_code_logs_default_path_does_not_search_outside_root(tmp_path):
     assert isinstance(result, ToolResult)
     assert result.status is ToolResultStatus.ERROR
     assert "No log file found" in result.error
-    # Searched paths must NOT include /tmp.
+    # Searched paths must NOT include the legacy ``/tmp/kestrel-claw.log``
+    # default. (We can't blanket-ban ``/tmp/`` because pytest's
+    # tmp_path itself lives under /tmp on Linux CI; the in-root
+    # ``logs/kestrel.log`` and ``kestrel.log`` defaults are still
+    # legitimate.)
     assert not any(
-        p.startswith("/tmp/")
-        for p in result.data["searched"]
+        "kestrel-claw.log" in p for p in result.data["searched"]
     ), (
-        f"default log search reached outside code_root: "
+        f"default log search included the legacy /tmp/kestrel-claw.log "
+        f"path: {result.data['searched']}"
+    )
+    # And every searched path must be inside code_root.
+    root_str = str(root.resolve())
+    assert all(
+        p.startswith(root_str) for p in result.data["searched"]
+    ), (
+        f"default log search reached outside code_root ({root_str}): "
         f"{result.data['searched']}"
     )
 
