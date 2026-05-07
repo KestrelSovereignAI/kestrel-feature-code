@@ -569,6 +569,83 @@ async def test_subprocess_calls_are_offloaded_via_to_thread():
 
 
 @pytest.mark.asyncio
+async def test_code_rollback_rejects_option_injection(feature):
+    """Codex round-2 finding #1: ``commit="--hard"`` + ``hard=False``
+    must NOT silently become ``git reset --hard`` (which discards
+    the working tree). The leading-hyphen guard rejects this
+    before invoking git."""
+    feat, _ = feature
+    feat._request_approval = AsyncMock(return_value=True)
+
+    invoked = []
+
+    async def _spy(*args, **kwargs):
+        invoked.append(args[0])
+        import subprocess as _sp
+        return _sp.CompletedProcess(args[0], returncode=0, stdout="", stderr="")
+
+    with patch("kestrel_feature_code.feature._run_subprocess", _spy):
+        result = await feat.code_rollback(commit="--hard", hard=False)
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "git-option injection" in result.error.lower()
+    # CRITICAL: git was NEVER invoked, so no working-tree damage.
+    assert invoked == []
+
+
+@pytest.mark.asyncio
+async def test_code_rollback_rejects_other_option_like_commits(feature):
+    feat, _ = feature
+    feat._request_approval = AsyncMock(return_value=True)
+    for bad in ["-f", "--force", "-x", "--recurse-submodules"]:
+        result = await feat.code_rollback(commit=bad, hard=False)
+        assert isinstance(result, ToolResult), bad
+        assert result.status is ToolResultStatus.ERROR, bad
+        assert "must not start with '-'" in result.error or "injection" in result.error.lower()
+
+
+@pytest.mark.asyncio
+async def test_code_search_skipped_files_returns_partial(tmp_path):
+    """Codex round-2 finding #2: silently skipping unreadable files
+    while still returning OK is partial-success masquerading as
+    complete. Now downgrades to PARTIAL with skipped_files in data."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    # A readable file with a match.
+    (root / "good.py").write_text("alpha\n", encoding="utf-8")
+    # A binary-content file the .py glob will pick up but
+    # read_text(utf-8) will reject.
+    bad = root / "bad.py"
+    bad.write_bytes(b"\xc3\x28invalid utf8\n")
+
+    feat = CodeFeature(agent=SimpleNamespace(features={}), code_root=str(root))
+
+    result = await feat.code_search("alpha")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["skipped_count"] == 1
+    assert any(
+        "bad.py" in s["file"] for s in result.data["skipped_files"]
+    )
+    assert result.data["total_matches"] == 1
+
+
+@pytest.mark.asyncio
+async def test_code_read_none_path_returns_failed_not_attribute_error(feature):
+    """Codex round-2 finding #3: tool args can be malformed (None,
+    non-str). _resolve_path now rejects them as ValueError so the
+    @tool envelope catches them, instead of AttributeError-ing out
+    of ``path.startswith``."""
+    feat, _ = feature
+    result = await feat.code_read(path=None)
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "must be a string" in result.error.lower()
+
+
+@pytest.mark.asyncio
 async def test_no_tool_method_raises_for_typical_failure_paths(feature):
     """#1042 envelope contract: every @tool method must return
     ToolResult, NEVER raise. Pin the contract for the common

@@ -64,34 +64,49 @@ def _search_file_contents(
     resolved: Path,
     pattern: str,
     file_pattern: str,
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], int, list[dict]]:
     """Search files synchronously for offloading via asyncio.to_thread.
 
-    Returns ``(matches[:50], total_matches)``. Caller MUST surface
-    ``total_matches`` so the LLM doesn't claim ``found 50 matches``
-    when there are 200 (#1042 honesty contract).
+    Returns ``(matches[:50], total_matches, skipped_files)``.
+
+    Caller MUST surface ``total_matches`` and ``skipped_files`` so
+    the LLM doesn't claim a complete search when binary files,
+    permission errors, or decode failures excluded part of the tree
+    (#1042 honesty contract; codex round-2 finding #2).
     """
     matches = []
     total_matches = 0
+    skipped: list[dict] = []
 
     for file_path in resolved.rglob(file_pattern):
         if not file_path.is_file():
             continue
         try:
             content = file_path.read_text(encoding="utf-8")
-            for i, line in enumerate(content.split("\n"), 1):
-                if pattern in line:
-                    total_matches += 1
-                    if len(matches) < 50:
-                        matches.append({
-                            "file": str(file_path.relative_to(code_root)),
-                            "line": i,
-                            "content": line.strip()[:200],
-                        })
-        except (UnicodeDecodeError, PermissionError, OSError):
-            continue  # Skip files that can't be read
+        except UnicodeDecodeError as e:
+            skipped.append({
+                "file": str(file_path.relative_to(code_root)),
+                "reason": f"decode_error: {e}",
+            })
+            continue
+        except (PermissionError, OSError) as e:
+            skipped.append({
+                "file": str(file_path.relative_to(code_root)),
+                "reason": f"{type(e).__name__}: {e}",
+            })
+            continue
 
-    return matches, total_matches
+        for i, line in enumerate(content.split("\n"), 1):
+            if pattern in line:
+                total_matches += 1
+                if len(matches) < 50:
+                    matches.append({
+                        "file": str(file_path.relative_to(code_root)),
+                        "line": i,
+                        "content": line.strip()[:200],
+                    })
+
+    return matches, total_matches, skipped
 
 
 class CodeFeature(Feature):
@@ -117,20 +132,35 @@ class CodeFeature(Feature):
     def _resolve_path(self, path: str) -> Path:
         """Resolve a path relative to code root, with security checks.
 
-        Raises ``ValueError`` only on the path-escape security check;
+        Raises ``ValueError`` for any malformed/escaping argument;
         every @tool method that calls this MUST catch ValueError and
         convert to ``ToolResult.failed`` so the security violation
         lands in the envelope, not as a raised exception.
 
         Use ``Path.is_relative_to`` for the containment check, NOT
-        ``str.startswith`` (codex round-1 finding #1). The string
-        form lets sibling-prefix paths escape: code root ``/tmp/repo``
-        would match ``/tmp/repo2/secret.py``. ``is_relative_to`` does
-        proper path-component containment.
+        ``str.startswith``. The string form lets sibling-prefix paths
+        escape: code root ``/tmp/repo`` would match
+        ``/tmp/repo2/secret.py``.
+
+        Codex round-2 finding #3: also reject ``None`` / non-string
+        inputs as ValueError so a malformed @tool arg lands in the
+        envelope instead of raising AttributeError out of
+        ``path.startswith``.
         """
+        if not isinstance(path, str):
+            raise ValueError(
+                f"Path must be a string, got {type(path).__name__}"
+            )
         if path.startswith("/"):
             path = path.lstrip("/")
-        resolved = (self.code_root / path).resolve()
+        try:
+            resolved = (self.code_root / path).resolve()
+        except (OSError, RuntimeError) as e:
+            # ``Path.resolve`` can raise on certain edge cases
+            # (windows path syntax, recursion loops). Surface as a
+            # ValueError so callers' standard envelope handling
+            # picks it up.
+            raise ValueError(f"Could not resolve path '{path}': {e}") from e
         try:
             is_inside = resolved.is_relative_to(self.code_root)
         except (TypeError, ValueError):
@@ -233,7 +263,7 @@ class CodeFeature(Feature):
             return ToolResult.failed(f"Path not found: {path}", data={"path": path})
 
         try:
-            matches, total_matches = await asyncio.to_thread(
+            matches, total_matches, skipped = await asyncio.to_thread(
                 _search_file_contents,
                 self.code_root,
                 resolved,
@@ -241,7 +271,9 @@ class CodeFeature(Feature):
                 file_pattern,
             )
         except Exception as e:
-            return ToolResult.failed(str(e), data={"pattern": pattern, "path": path})
+            return ToolResult.failed(
+                str(e), data={"pattern": pattern, "path": path}
+            )
 
         # Surface BOTH the truncated match list AND the real total
         # so the LLM can't lie about the result count (#1042).
@@ -249,17 +281,39 @@ class CodeFeature(Feature):
         confirmation = (
             f"Found {total_matches} match(es) for '{pattern}'"
             if not truncated
-            else f"Found {total_matches} match(es) for '{pattern}' (showing first {len(matches)})"
+            else (
+                f"Found {total_matches} match(es) for '{pattern}' "
+                f"(showing first {len(matches)})"
+            )
         )
-        return ToolResult.ok(
-            confirmation=confirmation,
-            data={
-                "pattern": pattern,
-                "matches": matches,
-                "total_matches": total_matches,
-                "truncated": truncated,
-            },
-        )
+        data = {
+            "pattern": pattern,
+            "matches": matches,
+            "total_matches": total_matches,
+            "truncated": truncated,
+            "skipped_files": skipped,
+            "skipped_count": len(skipped),
+        }
+
+        # Skipped files = partial-success: the search WAS performed,
+        # but excluded files outside the LLM's view. Downgrade to
+        # PARTIAL so the audit hook sees non-OK and the user knows
+        # the result isn't a complete picture (codex round-2
+        # finding #2).
+        if skipped:
+            return ToolResult.partial(
+                confirmation=(
+                    f"{confirmation}; {len(skipped)} file(s) were skipped "
+                    f"(unreadable or undecodable)"
+                ),
+                error=(
+                    f"{len(skipped)} file(s) skipped during search; "
+                    f"see skipped_files for details"
+                ),
+                data=data,
+            )
+
+        return ToolResult.ok(confirmation=confirmation, data=data)
 
     # ============== Write Operations (Require Approval) ==============
 
@@ -829,6 +883,22 @@ class CodeFeature(Feature):
         commit: str = "HEAD~1",
         hard: bool = False,
     ) -> ToolResult:
+        # Reject ``commit`` values that look like git options (codex
+        # round-2 finding #1). Without this guard,
+        # ``commit="--hard"`` becomes ``git reset --hard``, which
+        # discards the working tree even though the approval payload
+        # said ``"hard": false``. The confirmation would also lie:
+        # "Rolled back to --hard". A leading ``-`` is the simple
+        # check; alternatively we could rev-parse --verify the ref
+        # before reset, but the leading-hyphen ban is sufficient for
+        # the injection class and faster.
+        if not isinstance(commit, str) or commit.startswith("-"):
+            return ToolResult.failed(
+                f"Invalid commit ref '{commit}': must not start with '-' "
+                f"(possible git-option injection)",
+                data={"commit": commit, "hard": hard},
+            )
+
         try:
             approved = await self._request_approval(
                 "code_rollback",
@@ -852,6 +922,12 @@ class CodeFeature(Feature):
         cmd = [GIT_PATH, "reset"]
         if hard:
             cmd.append("--hard")
+        # The leading-hyphen check above is sufficient for option
+        # injection; we can't use ``--`` here because in ``git
+        # reset`` it separates refs from PATHS, not options. With
+        # ``--`` present, ``<commit>`` would be treated as a path
+        # and the reset would silently target HEAD with that path
+        # filter.
         cmd.append(commit)
 
         try:
