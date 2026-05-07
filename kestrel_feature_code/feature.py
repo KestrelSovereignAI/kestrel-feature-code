@@ -83,7 +83,17 @@ def _search_file_contents(
     total_matches = 0
     skipped: list[dict] = []
 
-    for file_path in resolved.rglob(file_pattern):
+    # ``rglob`` on a single file yields nothing, so calling
+    # ``code_search(path=<file>)`` would silently return 0 matches
+    # even when the file contains the pattern (codex round-4
+    # finding #1). When ``resolved`` is a regular file, search just
+    # that file; when it's a directory, rglob.
+    if resolved.is_file():
+        candidates = [resolved]
+    else:
+        candidates = list(resolved.rglob(file_pattern))
+
+    for file_path in candidates:
         if not file_path.is_file():
             continue
 
@@ -630,6 +640,11 @@ class CodeFeature(Feature):
                 data={"step": "add", "returncode": add_result.returncode},
             )
 
+        # By this point ``git add`` has already mutated the index.
+        # Any subsequent failure must surface ``staged=True`` so the
+        # operator knows there's leftover state in the working tree
+        # — saying "commit failed" without that detail hides a
+        # partial-success (codex round-4 finding #2).
         try:
             result = await _run_subprocess(
                 [GIT_PATH, "commit", "-m", message],
@@ -639,9 +654,29 @@ class CodeFeature(Feature):
                 timeout=GIT_OPERATION_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            return ToolResult.failed("Git commit operation timed out")
+            return ToolResult.failed(
+                "Git commit operation timed out",
+                data={
+                    "step": "commit",
+                    "staged": True,
+                    "warning": (
+                        "files were already staged via 'git add'; commit "
+                        "timed out — index may have leftover staged changes"
+                    ),
+                },
+            )
         except Exception as e:
-            return ToolResult.failed(str(e))
+            return ToolResult.failed(
+                str(e),
+                data={
+                    "step": "commit",
+                    "staged": True,
+                    "warning": (
+                        "files were already staged via 'git add'; commit "
+                        "failed — index may have leftover staged changes"
+                    ),
+                },
+            )
 
         if result.returncode != 0:
             stdout_text = result.stdout or ""
@@ -656,7 +691,15 @@ class CodeFeature(Feature):
                 )
             return ToolResult.failed(
                 stderr_text or "git commit failed",
-                data={"step": "commit", "returncode": result.returncode},
+                data={
+                    "step": "commit",
+                    "returncode": result.returncode,
+                    "staged": True,
+                    "warning": (
+                        "files were already staged via 'git add'; "
+                        "commit failed with non-zero exit"
+                    ),
+                },
             )
 
         try:
@@ -788,6 +831,18 @@ class CodeFeature(Feature):
         verbose: bool = False,
         fail_fast: bool = True,
     ) -> ToolResult:
+        # Validate bool args (codex round-4 finding #3). Strings
+        # like ``"false"`` are truthy in Python, so without this
+        # check ``fail_fast="false"`` would silently append ``-x``
+        # and run only the first failing test.
+        for arg_name, arg_val in (("verbose", verbose), ("fail_fast", fail_fast)):
+            if not isinstance(arg_val, bool):
+                return ToolResult.failed(
+                    f"Invalid {arg_name} '{arg_val}': must be a real bool, "
+                    f"not {type(arg_val).__name__}",
+                    data={arg_name: arg_val, "type": type(arg_val).__name__},
+                )
+
         cmd = [PYTHON_PATH, "-m", "pytest"]
 
         if path:

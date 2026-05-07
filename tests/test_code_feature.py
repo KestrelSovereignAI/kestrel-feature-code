@@ -809,6 +809,70 @@ async def test_code_logs_non_int_lines_returns_failed(feature):
 
 
 @pytest.mark.asyncio
+async def test_code_search_on_single_file_finds_matches(feature):
+    """Codex round-4 finding #1: ``Path.rglob()`` on a file yields
+    nothing, so ``code_search(path=<file>)`` returned 0 matches even
+    when the file contained the pattern. Now searches the file
+    directly when ``resolved.is_file()``."""
+    feat, root = feature
+    target = root / "sample.py"
+    target.write_text("alpha\nbeta alpha\n", encoding="utf-8")
+
+    result = await feat.code_search("alpha", path="sample.py")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["total_matches"] == 2
+    assert all("sample.py" in m["file"] for m in result.data["matches"])
+
+
+@pytest.mark.asyncio
+async def test_code_commit_failed_commit_after_add_surfaces_staged(feature):
+    """Codex round-4 finding #2: ``git add`` mutates the index;
+    if the subsequent ``git commit`` fails, the operator must be
+    told staged changes still exist. Otherwise the user runs the
+    next thing thinking the working tree is clean."""
+    feat, _ = feature
+    feat._request_approval = AsyncMock(return_value=True)
+
+    async def _fake_subprocess(*args, **kwargs):
+        cmd = args[0]
+        import subprocess as _sp
+        if cmd[1] == "add":
+            return _sp.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+        if cmd[1] == "commit":
+            return _sp.CompletedProcess(
+                cmd, returncode=128, stdout="",
+                stderr="error: commit failed for some reason",
+            )
+        return _sp.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    with patch("kestrel_feature_code.feature._run_subprocess", _fake_subprocess):
+        result = await feat.code_commit(message="test")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["staged"] is True
+    assert "staged" in result.data["warning"].lower()
+
+
+@pytest.mark.asyncio
+async def test_code_test_rejects_non_bool_flags(feature):
+    """Codex round-4 finding #3: ``fail_fast="false"`` is truthy,
+    so without bool validation it would silently append ``-x`` and
+    run only the first failing test."""
+    feat, _ = feature
+    feat._request_approval = AsyncMock(return_value=True)
+    for arg_name in ("verbose", "fail_fast"):
+        for bad_val in ["true", "false", 1, 0]:
+            kwargs = {arg_name: bad_val, "path": "."}
+            result = await feat.code_test(**kwargs)
+            assert isinstance(result, ToolResult), (arg_name, bad_val)
+            assert result.status is ToolResultStatus.ERROR, (arg_name, bad_val)
+            assert "real bool" in result.error.lower(), (arg_name, bad_val)
+
+
+@pytest.mark.asyncio
 async def test_code_read_none_path_returns_failed_not_attribute_error(feature):
     """Codex round-2 finding #3: tool args can be malformed (None,
     non-str). _resolve_path now rejects them as ValueError so the
