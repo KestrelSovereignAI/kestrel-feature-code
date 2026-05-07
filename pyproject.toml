@@ -15,6 +15,10 @@ test = [
 
 [project.entry-points."kestrel_sovereign.features"]
 CodeFeature = "kestrel_feature_code.feature:CodeFeature"
+# Backward-compat for v0.1.0 deployments that referenced
+# ``CodeEditFeature`` directly in their entry-point config or
+# plugin loaders. Removed in v0.3.0 alongside the Python alias.
+CodeEditFeature = "kestrel_feature_code.feature:CodeFeature"
 
 [build-system]
 requires = ["hatchling"]

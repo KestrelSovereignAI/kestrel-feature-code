@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from kestrel_feature_code.feature import CodeFeature, CodeEditFeature, _run_subprocess
+from kestrel_feature_code.feature import CodeFeature, _run_subprocess
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 
@@ -28,9 +28,24 @@ def feature(tmp_path):
 def test_backward_compat_alias_resolves_to_codefeature():
     """v0.2.0 rename: CodeEditFeature is kept as an alias for one
     release so external entry-point references and import sites can
-    cut over without thrashing. Pin the alias so a future cleanup
-    doesn't break it silently."""
-    assert CodeEditFeature is CodeFeature
+    cut over without thrashing. Importing it MUST resolve to
+    CodeFeature AND emit a DeprecationWarning (claude review #6)."""
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        from kestrel_feature_code.feature import CodeEditFeature as _alias
+    assert _alias is CodeFeature
+    assert any(
+        issubclass(w.category, DeprecationWarning) for w in caught
+    ), "CodeEditFeature import must emit DeprecationWarning"
+    # Top-level package re-export goes through the same alias path.
+    with warnings.catch_warnings(record=True) as caught2:
+        warnings.simplefilter("always")
+        from kestrel_feature_code import CodeEditFeature as _alias2
+    assert _alias2 is CodeFeature
+    assert any(
+        issubclass(w.category, DeprecationWarning) for w in caught2
+    )
 
 
 def test_resolve_path_rejects_escape(feature):
@@ -256,8 +271,12 @@ async def test_code_test_passed_vs_failed_in_confirmation(feature):
 
     with patch("kestrel_feature_code.feature._run_subprocess", _failing):
         result = await feat.code_test(path=".")
-    assert result.status is ToolResultStatus.OK
+    # Claude review #5: failed tests = PARTIAL (the tool ran, but
+    # the test run failed). Audit hooks reading ``result.status``
+    # must see something other than OK on failure.
+    assert result.status is ToolResultStatus.PARTIAL
     assert "FAILED" in result.confirmation
+    assert "non-zero" in result.error.lower()
     assert result.data["passed"] is False
 
 
@@ -348,6 +367,87 @@ async def test_subprocess_calls_are_offloaded_via_to_thread():
         )
         mock_thread.assert_awaited_once()
         assert result.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_code_logs_user_path_relative_escape_is_sandboxed(feature):
+    """Claude review #1: ``log_file=`` is user input and MUST go
+    through _resolve_path. The previous version skipped the
+    sandbox check entirely, so a relative escape like
+    ``../../../etc/passwd`` would read outside the code root.
+
+    Note: ``_resolve_path`` strips leading ``/`` from absolute
+    paths and remaps them under code_root (so ``/etc/passwd`` →
+    ``code_root/etc/passwd`` which is safely contained, just
+    nonexistent). The real bypass is the relative ``..`` form,
+    which ``Path.resolve()`` collapses past the root."""
+    feat, _ = feature
+    result = await feat.code_logs(log_file="../../../etc/passwd")
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "escapes code root" in result.error
+
+
+@pytest.mark.asyncio
+async def test_code_logs_user_path_inside_root_works(feature):
+    """Sanity: a log_file inside the root passes the sandbox check
+    and is read normally."""
+    feat, root = feature
+    log = root / "custom.log"
+    log.write_text("entry 1\n", encoding="utf-8")
+
+    result = await feat.code_logs(log_file="custom.log")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK
+    assert "entry 1" in result.data["content"]
+
+
+@pytest.mark.asyncio
+async def test_code_commit_invalid_path_rejected_before_approval_consumed(feature):
+    """Claude review #2: validation must happen BEFORE approval is
+    consumed. Otherwise the user approves an operation we already
+    knew was structurally invalid."""
+    feat, _ = feature
+    approval_calls = []
+
+    async def _spy_approve(*args, **kwargs):
+        approval_calls.append((args, kwargs))
+        return True
+    feat._request_approval = _spy_approve
+
+    result = await feat.code_commit(message="x", files="../escaped")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "escapes code root" in result.error
+    assert approval_calls == [], (
+        "approval was requested for an operation that was already "
+        "known to be structurally invalid; reorder validation "
+        "before approval"
+    )
+
+
+@pytest.mark.asyncio
+async def test_code_lint_zero_issues_when_stdout_empty_with_nonzero_exit(feature):
+    """Claude review #3: ruff exiting non-zero with empty stdout
+    must NOT count the placeholder ``(no issues)`` as 1 issue."""
+    feat, _ = feature
+
+    async def _empty_stdout_nonzero(*args, **kwargs):
+        import subprocess as _sp
+        return _sp.CompletedProcess(args[0], returncode=2, stdout="", stderr="")
+
+    with patch("kestrel_feature_code.feature._run_subprocess", _empty_stdout_nonzero):
+        result = await feat.code_lint()
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["has_issues"] is True
+    # The bug: previously this returned issue_count=1 (counting
+    # the "(no issues)" placeholder string).
+    assert result.data["issue_count"] == 0
+    assert "0 issue line(s)" in result.confirmation
 
 
 @pytest.mark.asyncio

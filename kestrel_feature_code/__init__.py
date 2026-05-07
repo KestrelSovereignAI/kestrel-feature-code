@@ -26,6 +26,19 @@ Tools:
     !code-rollback [commit]     Rollback to previous commit (requires approval)
 """
 
-from .feature import CodeFeature, CodeEditFeature
+from .feature import CodeFeature
 
-__all__ = ["CodeFeature", "CodeEditFeature"]
+__all__ = ["CodeFeature"]
+
+
+def __getattr__(name: str):
+    """Lazy backward-compat for ``from kestrel_feature_code import
+    CodeEditFeature``. Resolves through the module-level alias in
+    ``feature.py``, which emits a DeprecationWarning. Removed in
+    v0.3.0."""
+    if name == "CodeEditFeature":
+        from . import feature as _feature
+        return _feature.CodeEditFeature
+    raise AttributeError(
+        f"module 'kestrel_feature_code' has no attribute {name!r}"
+    )

@@ -355,6 +355,15 @@ class CodeFeature(Feature):
         message: str,
         files: str = ".",
     ) -> ToolResult:
+        # Validate the path BEFORE asking for approval (claude
+        # review finding #2). If the user approves only to find
+        # out the operation was structurally invalid, we've burned
+        # their attention on something we knew couldn't proceed.
+        try:
+            resolved = self._resolve_path(files)
+        except ValueError as e:
+            return ToolResult.failed(str(e), data={"files": files})
+
         try:
             approved = await self._request_approval(
                 "code_commit",
@@ -370,11 +379,6 @@ class CodeFeature(Feature):
                 "Commit not approved",
                 data={"requires_approval": True},
             )
-
-        try:
-            resolved = self._resolve_path(files)
-        except ValueError as e:
-            return ToolResult.failed(str(e), data={"files": files})
 
         # Stage files. Use capture_output so a failed `git add` lands
         # in the envelope instead of raising CalledProcessError out of
@@ -575,23 +579,26 @@ class CodeFeature(Feature):
             return ToolResult.failed(str(e), data={"path": path})
 
         passed = result.returncode == 0
-        # Honesty: "tests passed" vs "tests FAILED" — pytest exit
-        # codes have specific meanings. Don't say "Tests run" — say
-        # what happened (#1042).
-        if passed:
-            confirmation = "Tests passed"
-        else:
-            confirmation = f"Tests FAILED (return code {result.returncode})"
         out = result.stdout or ""
         err = result.stderr or ""
-        return ToolResult.ok(
-            confirmation=confirmation,
-            data={
-                "passed": passed,
-                "return_code": result.returncode,
-                "output": out[-2000:] if len(out) > 2000 else out,
-                "errors": err[-1000:] if err else None,
-            },
+        # Status-level honesty (claude review finding #5): the tool
+        # ran correctly either way, but a failing test run is a
+        # PARTIAL result. Without this, audit hooks / narration
+        # guards reading ``result.status`` would see OK on every
+        # invocation and conclude "tests succeeded" regardless of
+        # outcome.
+        data = {
+            "passed": passed,
+            "return_code": result.returncode,
+            "output": out[-2000:] if len(out) > 2000 else out,
+            "errors": err[-1000:] if err else None,
+        }
+        if passed:
+            return ToolResult.ok(confirmation="Tests passed", data=data)
+        return ToolResult.partial(
+            confirmation=f"Tests FAILED (return code {result.returncode})",
+            error=f"pytest exited with non-zero return code {result.returncode}",
+            data=data,
         )
 
     @tool(
@@ -624,12 +631,15 @@ class CodeFeature(Feature):
             return ToolResult.failed(str(e), data={"path": path})
 
         has_issues = result.returncode != 0
-        out = result.stdout or "(no issues)"
-        # Counting "\n" overcounts because ruff's output includes
-        # blank lines + a trailing newline. Trim the trailing newline
-        # before counting issue rows.
-        issue_lines = [l for l in out.splitlines() if l.strip()]
+        # Compute issue count from REAL stdout, not the display
+        # fallback (claude review finding #3). Without this, ruff
+        # exiting non-zero with empty stdout would count the
+        # placeholder string ``(no issues)`` as 1 issue line.
+        raw_stdout = result.stdout or ""
+        issue_lines = [l for l in raw_stdout.splitlines() if l.strip()]
         issue_count = len(issue_lines) if has_issues else 0
+        # Display-time fallback (separate from the count above).
+        out = raw_stdout if raw_stdout.strip() else "(no issues)"
 
         confirmation = (
             "Lint clean (no issues)"
@@ -657,9 +667,26 @@ class CodeFeature(Feature):
         errors_only: bool = False,
         log_file: str = None,
     ) -> ToolResult:
-        log_paths = [
-            log_file,
-            "/tmp/kestrel-claw.log",
+        # User-supplied ``log_file`` MUST go through _resolve_path
+        # (claude review finding #1). Without this, log_file=
+        # "/etc/passwd" or "../../../sensitive.txt" reads outside
+        # the code root. ``_resolve_path`` enforces the same
+        # sandbox other tools use.
+        user_path: Optional[Path] = None
+        if log_file is not None:
+            try:
+                user_path = self._resolve_path(log_file)
+            except ValueError as e:
+                return ToolResult.failed(str(e), data={"log_file": log_file})
+
+        # The two well-known fallbacks (``/tmp/kestrel-claw.log``
+        # and ``code_root/...``) are operator-controlled, NOT user
+        # input — those don't need _resolve_path. The user-supplied
+        # path comes first so an explicit log_file= overrides
+        # auto-detect.
+        log_paths: List[Optional[Path]] = [
+            user_path,
+            Path("/tmp/kestrel-claw.log"),
             self.code_root / "logs" / "kestrel.log",
             self.code_root / "kestrel.log",
         ]
@@ -667,10 +694,9 @@ class CodeFeature(Feature):
         log_content: Optional[str] = None
         used_path: Optional[str] = None
         try:
-            for lp in log_paths:
-                if lp is None:
+            for p in log_paths:
+                if p is None:
                     continue
-                p = Path(lp)
                 if p.exists():
                     log_content = p.read_text()
                     used_path = str(p)
@@ -788,7 +814,21 @@ class CodeFeature(Feature):
         )
 
 
-# Backwards-compat alias for the v0.1.0 entry-point name. Removed in
-# v0.3.0. Importing CodeEditFeature still works but emits no warning;
-# new code should use CodeFeature.
-CodeEditFeature = CodeFeature
+# Backwards-compat alias for the v0.1.0 class name. Removed in
+# v0.3.0. Importing ``CodeEditFeature`` from this module still
+# resolves to ``CodeFeature``, but emits a DeprecationWarning so
+# external callers learn to migrate before the v0.3.0 cutover.
+def __getattr__(name: str):
+    if name == "CodeEditFeature":
+        import warnings
+        warnings.warn(
+            "CodeEditFeature is a deprecated alias for CodeFeature; "
+            "the alias will be removed in v0.3.0. Update imports to "
+            "``from kestrel_feature_code.feature import CodeFeature``.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return CodeFeature
+    raise AttributeError(
+        f"module 'kestrel_feature_code.feature' has no attribute {name!r}"
+    )
