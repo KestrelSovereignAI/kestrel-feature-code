@@ -127,7 +127,11 @@ class CodeFeature(Feature):
         except Exception as e:
             return ToolResult.failed(str(e), data={"path": path})
 
-        all_lines = content.split("\n")
+        # ``splitlines()`` correctly handles the trailing newline:
+        # ``"line1\nline2\n".splitlines()`` is ``["line1", "line2"]``
+        # (2 lines), not the 3-element list ``split("\n")`` produces
+        # (claude review round 2 finding #2).
+        all_lines = content.splitlines()
         if start_line or end_line:
             start_idx = (start_line - 1) if start_line else 0
             end_idx = end_line if end_line else len(all_lines)
@@ -452,6 +456,26 @@ class CodeFeature(Feature):
                 confirmation=f"Committed (commit hash unavailable)",
                 error=f"git rev-parse failed after commit: {e}",
                 data={"committed": True, "message": message},
+            )
+
+        # rev-parse can also exit non-zero without raising (corrupted
+        # repo, detached refs, etc.). Without this guard, ``commit_hash``
+        # becomes "" and we'd return ToolResult.ok with the empty
+        # confirmation "Committed : message" — claude review round 2
+        # finding #1.
+        if hash_result.returncode != 0:
+            return ToolResult.partial(
+                confirmation="Committed (commit hash unavailable)",
+                error=(
+                    f"git rev-parse HEAD returned non-zero "
+                    f"({hash_result.returncode}) after the commit succeeded: "
+                    f"{hash_result.stderr or '(no stderr)'}"
+                ),
+                data={
+                    "committed": True,
+                    "message": message,
+                    "rev_parse_returncode": hash_result.returncode,
+                },
             )
 
         commit_hash = hash_result.stdout.strip()[:8]

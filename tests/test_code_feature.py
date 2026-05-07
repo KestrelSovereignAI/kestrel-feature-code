@@ -67,8 +67,15 @@ async def test_code_read_returns_tool_result_ok_with_file_contents(feature):
     assert "Read" in result.confirmation
     assert "sample.py" in result.confirmation
     assert result.data["path"] == "sample.py"
+    # ``content`` echoes what was on disk (preserves trailing
+    # newline for downstream callers that need byte-exact data).
     assert result.data["content"] == "line1\nline2\n"
-    assert result.data["total_lines"] == 3
+    # But the line COUNT must be honest: the file has 2 lines, not
+    # 3 (claude review round 2 finding #2). ``split("\n")`` was
+    # producing a phantom empty 3rd element from the trailing
+    # newline.
+    assert result.data["total_lines"] == 2
+    assert result.data["shown_lines"] == 2
 
 
 @pytest.mark.asyncio
@@ -367,6 +374,66 @@ async def test_subprocess_calls_are_offloaded_via_to_thread():
         )
         mock_thread.assert_awaited_once()
         assert result.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_commit_rev_parse_nonzero_returncode_returns_partial(feature):
+    """Claude review round 2 finding #1: ``git rev-parse HEAD``
+    can exit non-zero without raising (corrupted repo, detached
+    refs). Without the explicit returncode check the result was
+    ``ToolResult.ok`` with an empty commit_hash and the broken
+    confirmation ``Committed : message``."""
+    feat, _ = feature
+    feat._request_approval = AsyncMock(return_value=True)
+
+    async def _fake_subprocess(*args, **kwargs):
+        cmd = args[0]
+        import subprocess as _sp
+        if cmd[1] == "add":
+            return _sp.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+        if cmd[1] == "commit":
+            return _sp.CompletedProcess(
+                cmd, returncode=0, stdout="committed", stderr=""
+            )
+        if cmd[1] == "rev-parse":
+            # Non-zero exit without raising — corrupted-repo case.
+            return _sp.CompletedProcess(
+                cmd, returncode=128,
+                stdout="",
+                stderr="fatal: bad object HEAD",
+            )
+        return _sp.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    with patch("kestrel_feature_code.feature._run_subprocess", _fake_subprocess):
+        result = await feat.code_commit(message="msg")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL, (
+        "rev-parse non-zero exit must produce PARTIAL — the commit "
+        "succeeded but we can't report the hash honestly"
+    )
+    assert "commit hash unavailable" in result.confirmation.lower()
+    assert "non-zero" in result.error.lower()
+    assert result.data["committed"] is True
+    assert result.data["rev_parse_returncode"] == 128
+
+
+def test_codeedit_feature_attribute_access_path_emits_warning():
+    """Claude review round 2 finding #4: the
+    ``import kestrel_feature_code; kestrel_feature_code.feature.CodeEditFeature``
+    form goes through ``feature.__getattr__`` (NOT through the
+    package ``__init__.__getattr__``). A regression in
+    ``feature.__getattr__`` would slip past the from-import test
+    coverage. Pin this access form."""
+    import warnings
+    import kestrel_feature_code  # already imported, but explicit
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cls = kestrel_feature_code.feature.CodeEditFeature
+    assert cls is CodeFeature
+    assert any(
+        issubclass(w.category, DeprecationWarning) for w in caught
+    ), "attribute-access form must emit DeprecationWarning"
 
 
 @pytest.mark.asyncio
