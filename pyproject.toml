@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-code"
-version = "0.1.0"
+version = "0.2.0"
 description = "Codebase tooling feature for Kestrel Sovereign — read, search, edit, lint, test, commit, rollback with approval gates"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -30,7 +30,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "kestrel-sovereign-sdk>=0.2,<1",
+    "kestrel-sovereign-sdk>=0.4,<1",
 ]
 
 [project.optional-dependencies]
@@ -45,7 +45,11 @@ Source = "https://github.com/KestrelSovereignAI/kestrel-feature-code"
 Issues = "https://github.com/KestrelSovereignAI/kestrel-feature-code/issues"
 
 [project.entry-points."kestrel_sovereign.features"]
-CodeEditFeature = "kestrel_feature_code.feature:CodeEditFeature"
+CodeFeature = "kestrel_feature_code.feature:CodeFeature"
+# Backward-compat for v0.1.0 deployments that referenced
+# ``CodeEditFeature`` in their entry-point config or plugin
+# loaders. Removed in v0.3.0 alongside the Python alias.
+CodeEditFeature = "kestrel_feature_code.feature:CodeFeature"
 
 [build-system]
 requires = ["hatchling"]

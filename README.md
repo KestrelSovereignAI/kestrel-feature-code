@@ -8,7 +8,9 @@ Codebase tooling feature for Kestrel Sovereign agents — 10 tools spanning read
 uv pip install kestrel-feature-code
 ```
 
-The feature is auto-discovered by Kestrel Sovereign via the `kestrel_sovereign.features` entry point — install it alongside `kestrel-sovereign` and `CodeEditFeature` registers itself at startup.
+The feature is auto-discovered by Kestrel Sovereign via the `kestrel_sovereign.features` entry point — install it alongside `kestrel-sovereign` and `CodeFeature` registers itself at startup.
+
+> **v0.2.0 rename:** `CodeEditFeature` → `CodeFeature`. The old name is kept as a deprecated alias through v0.2.x for entry-point and import cutover; importing it emits a `DeprecationWarning`. Removed in v0.3.0. All `@tool` methods now return `kestrel_sdk.tools.result.ToolResult` (was: `Dict[str, Any]`); see kestrel-sovereign #1042 for the honesty contract.
 
 ## Configuration
 
@@ -33,7 +35,7 @@ The feature is auto-discovered by Kestrel Sovereign via the `kestrel_sovereign.f
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.2,<1` — base `Feature`, `tool`, `ToolCategory`
+- `kestrel-sovereign-sdk>=0.4,<1` — base `Feature`, `tool`, `ToolCategory`, `ToolResult`
 
 No runtime dependency on `kestrel-sovereign` itself; the feature operates against any codebase via `KESTREL_CODE_ROOT`.
 

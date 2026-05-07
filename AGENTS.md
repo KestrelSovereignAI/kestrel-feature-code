@@ -10,12 +10,13 @@ kestrel_feature_code/
 ├── README.md
 └── kestrel_feature_code/
     ├── __init__.py
-    └── feature.py    # CodeEditFeature — all tools defined here
+    └── feature.py    # CodeFeature — all tools defined here
 ```
 
 ## Entry Points
 
-- `kestrel_sovereign.features`: `CodeEditFeature = "kestrel_feature_code.feature:CodeEditFeature"`
+- `kestrel_sovereign.features`: `CodeFeature = "kestrel_feature_code.feature:CodeFeature"`
+- Backward-compat alias `CodeEditFeature` resolves to the same class via `__getattr__` (emits `DeprecationWarning`); removed in v0.3.0.
 
 ## Key Files to Read First
 
