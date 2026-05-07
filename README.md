@@ -14,7 +14,9 @@ uv pip install git+https://github.com/KestrelSovereignAI/kestrel-feature-code.gi
 
 ## Usage
 
-Once installed, the `CodeEditFeature` is automatically discovered by kestrel-sovereign via the `kestrel_sovereign.features` entry point.
+Once installed, `CodeFeature` is automatically discovered by kestrel-sovereign via the `kestrel_sovereign.features` entry point.
+
+> **v0.2.0 rename:** `CodeEditFeature` → `CodeFeature`. The old name is kept as an alias through v0.2.x for entry-point cutover; remove all `CodeEditFeature` references before v0.3.0. All `@tool` methods now return `kestrel_sdk.tools.result.ToolResult` (was: `Dict[str, Any]`); see #1042 for the honesty contract.
 
 ### Commands
 

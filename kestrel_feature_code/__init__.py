@@ -26,6 +26,6 @@ Tools:
     !code-rollback [commit]     Rollback to previous commit (requires approval)
 """
 
-from .feature import CodeEditFeature
+from .feature import CodeFeature, CodeEditFeature
 
-__all__ = ["CodeEditFeature"]
+__all__ = ["CodeFeature", "CodeEditFeature"]
