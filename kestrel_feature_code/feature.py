@@ -121,11 +121,21 @@ class CodeFeature(Feature):
         every @tool method that calls this MUST catch ValueError and
         convert to ``ToolResult.failed`` so the security violation
         lands in the envelope, not as a raised exception.
+
+        Use ``Path.is_relative_to`` for the containment check, NOT
+        ``str.startswith`` (codex round-1 finding #1). The string
+        form lets sibling-prefix paths escape: code root ``/tmp/repo``
+        would match ``/tmp/repo2/secret.py``. ``is_relative_to`` does
+        proper path-component containment.
         """
         if path.startswith("/"):
             path = path.lstrip("/")
         resolved = (self.code_root / path).resolve()
-        if not str(resolved).startswith(str(self.code_root)):
+        try:
+            is_inside = resolved.is_relative_to(self.code_root)
+        except (TypeError, ValueError):
+            is_inside = False
+        if not is_inside:
             raise ValueError(f"Path escapes code root: {path}")
         return resolved
 
@@ -682,15 +692,45 @@ class CodeFeature(Feature):
         except Exception as e:
             return ToolResult.failed(str(e), data={"path": path})
 
-        has_issues = result.returncode != 0
-        # Compute issue count from REAL stdout, not the display
-        # fallback. Otherwise non-zero exit + empty stdout would
-        # count the placeholder "(no issues)" string as 1 issue.
+        # Distinguish lint-found-issues (rc=1) from invocation
+        # errors (rc=2 or stderr present). Codex round-1 finding #2:
+        # if ruff is missing, config parsing fails, etc., the
+        # previous code returned ``Lint found 0 issue line(s)`` —
+        # a false confirmation. Treat those as ToolResult.failed so
+        # the operator sees the real problem.
         raw_stdout = result.stdout or ""
+        raw_stderr = result.stderr or ""
         issue_lines = [l for l in raw_stdout.splitlines() if l.strip()]
-        issue_count = len(issue_lines) if has_issues else 0
-        out = raw_stdout if raw_stdout.strip() else "(no issues)"
+        issue_count = len(issue_lines)
 
+        # ruff exit code semantics: 0=clean, 1=lint issues found,
+        # 2=invocation error (missing config, bad args, etc.).
+        # Anything ≥2 OR (non-zero with no issue output AND stderr
+        # present) is an invocation error, not a lint finding.
+        if result.returncode >= 2:
+            return ToolResult.failed(
+                f"Ruff invocation failed (return code {result.returncode}): "
+                f"{raw_stderr.strip() or 'unknown error'}",
+                data={
+                    "path": path,
+                    "returncode": result.returncode,
+                    "stderr": raw_stderr[-1000:] if raw_stderr else None,
+                },
+            )
+        if result.returncode != 0 and issue_count == 0 and raw_stderr.strip():
+            # Non-zero exit, no findings on stdout, but stderr says
+            # something happened — that's an invocation error too.
+            return ToolResult.failed(
+                f"Ruff invocation failed: {raw_stderr.strip()}",
+                data={
+                    "path": path,
+                    "returncode": result.returncode,
+                    "stderr": raw_stderr[-1000:],
+                },
+            )
+
+        has_issues = result.returncode != 0
+        out = raw_stdout if raw_stdout.strip() else "(no issues)"
         confirmation = (
             "Lint clean (no issues)"
             if not has_issues
@@ -701,7 +741,7 @@ class CodeFeature(Feature):
             data={
                 "has_issues": has_issues,
                 "output": out[-2000:] if len(out) > 2000 else out,
-                "issue_count": issue_count,
+                "issue_count": issue_count if has_issues else 0,
             },
         )
 
@@ -727,9 +767,14 @@ class CodeFeature(Feature):
             except ValueError as e:
                 return ToolResult.failed(str(e), data={"log_file": log_file})
 
+        # Default-log discovery is constrained to ``code_root``
+        # (codex round-1 finding #3). The previous default included
+        # ``/tmp/kestrel-claw.log``, which violated the package's
+        # sandbox contract: read-only ops must stay inside the
+        # working directory unless the user explicitly opts out via
+        # an in-root ``log_file=`` (which goes through _resolve_path).
         log_paths: List[Optional[Path]] = [
             user_path,
-            Path("/tmp/kestrel-claw.log"),
             self.code_root / "logs" / "kestrel.log",
             self.code_root / "kestrel.log",
         ]

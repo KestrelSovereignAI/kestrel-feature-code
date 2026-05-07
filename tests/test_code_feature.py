@@ -73,6 +73,22 @@ def test_resolve_path_rejects_escape(feature):
         feat._resolve_path("../outside.py")
 
 
+def test_resolve_path_rejects_sibling_prefix_escape(tmp_path):
+    """Codex round-1 finding #1: ``str.startswith`` lets sibling-
+    prefix paths escape — code root ``/x/repo`` would match
+    ``/x/repo2/secret.py``. The fix uses ``Path.is_relative_to`` for
+    proper path-component containment."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    sibling = tmp_path / "repo2"
+    sibling.mkdir()
+    (sibling / "secret.py").write_text("secret\n", encoding="utf-8")
+
+    feat = CodeFeature(agent=SimpleNamespace(features={}), code_root=str(root))
+    with pytest.raises(ValueError, match="escapes code root"):
+        feat._resolve_path("../repo2/secret.py")
+
+
 @pytest.mark.asyncio
 async def test_code_read_returns_tool_result_ok_with_file_contents(feature):
     feat, root = feature
@@ -391,23 +407,80 @@ async def test_code_lint_clean_vs_issues_in_confirmation(feature):
 
 
 @pytest.mark.asyncio
-async def test_code_lint_zero_issues_when_stdout_empty_with_nonzero_exit(feature):
-    """ruff exiting non-zero with empty stdout must NOT count the
-    placeholder ``(no issues)`` as 1 issue."""
+async def test_code_lint_invocation_error_returns_failed_not_ok(feature):
+    """Codex round-1 finding #2: ruff exiting non-zero with stderr
+    is an INVOCATION error (missing config, bad args, ruff not
+    installed), not a lint finding. Previous code returned
+    ToolResult.ok with ``Lint found 0 issue line(s)`` — a false
+    confirmation."""
     feat, _ = feature
 
-    async def _empty_stdout_nonzero(*args, **kwargs):
+    async def _ruff_missing(*args, **kwargs):
         import subprocess as _sp
-        return _sp.CompletedProcess(args[0], returncode=2, stdout="", stderr="")
+        return _sp.CompletedProcess(
+            args[0], returncode=2, stdout="",
+            stderr="error: invalid configuration",
+        )
 
-    with patch("kestrel_feature_code.feature._run_subprocess", _empty_stdout_nonzero):
+    with patch("kestrel_feature_code.feature._run_subprocess", _ruff_missing):
         result = await feat.code_lint()
 
     assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR, (
+        "ruff invocation errors must NOT be reported as 0-issue OK"
+    )
+    assert "invocation failed" in result.error.lower()
+    assert result.data["returncode"] == 2
+
+
+@pytest.mark.asyncio
+async def test_code_lint_legitimate_findings_with_no_stdout_still_ok(feature):
+    """Edge: rc=1 (lint findings) with no stderr and no stdout is
+    weird but not necessarily an invocation error — rc=1 is the
+    'findings exist' signal, so treat it as OK with 0 issues. The
+    invocation-error gate only fires on rc>=2 OR rc!=0+stderr."""
+    feat, _ = feature
+
+    async def _rc1_empty(*args, **kwargs):
+        import subprocess as _sp
+        return _sp.CompletedProcess(args[0], returncode=1, stdout="", stderr="")
+
+    with patch("kestrel_feature_code.feature._run_subprocess", _rc1_empty):
+        result = await feat.code_lint()
+
     assert result.status is ToolResultStatus.OK
     assert result.data["has_issues"] is True
     assert result.data["issue_count"] == 0
-    assert "0 issue line(s)" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_code_logs_default_path_does_not_search_outside_root(tmp_path):
+    """Codex round-1 finding #3: the default fallback used to
+    include ``/tmp/kestrel-claw.log``, which violated the sandbox.
+    With no in-root logs, the result must be ``ToolResult.failed``
+    rather than reading a /tmp file."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    # Plant a /tmp file that the previous default would have read.
+    tmp_log = Path("/tmp/kestrel-claw.log")
+    if tmp_log.exists():
+        # Don't trample an existing file; skip if present.
+        pytest.skip("/tmp/kestrel-claw.log already exists on this host")
+    feat = CodeFeature(agent=SimpleNamespace(features={}), code_root=str(root))
+
+    result = await feat.code_logs(lines=10)
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "No log file found" in result.error
+    # Searched paths must NOT include /tmp.
+    assert not any(
+        p.startswith("/tmp/")
+        for p in result.data["searched"]
+    ), (
+        f"default log search reached outside code_root: "
+        f"{result.data['searched']}"
+    )
 
 
 @pytest.mark.asyncio
