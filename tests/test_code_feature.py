@@ -644,6 +644,171 @@ async def test_code_search_skipped_files_returns_partial(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_code_rollback_rejects_non_bool_hard(feature):
+    """Codex round-3 finding #1: ``hard="false"`` (string) is truthy
+    in Python. Without bool-type validation, this would run ``git
+    reset --hard`` even though the user / approval thought ``hard``
+    was False. Reject non-bool ``hard`` before approval is consumed."""
+    feat, _ = feature
+    feat._request_approval = AsyncMock(return_value=True)
+
+    invoked = []
+
+    async def _spy(*args, **kwargs):
+        invoked.append(args[0])
+        import subprocess as _sp
+        return _sp.CompletedProcess(args[0], returncode=0, stdout="", stderr="")
+
+    with patch("kestrel_feature_code.feature._run_subprocess", _spy):
+        for bad_hard in ["false", "true", 1, 0, "yes", None]:
+            result = await feat.code_rollback(commit="HEAD~1", hard=bad_hard)
+            assert isinstance(result, ToolResult), bad_hard
+            assert result.status is ToolResultStatus.ERROR, bad_hard
+            assert "real bool" in result.error.lower(), bad_hard
+
+    # CRITICAL: git was NEVER invoked — no working-tree damage.
+    assert invoked == []
+
+
+@pytest.mark.asyncio
+async def test_code_search_skips_symlink_escape(tmp_path):
+    """Codex round-3 finding #2: a symlinked file inside code_root
+    that points OUTSIDE must not be read. Pre-fix, code_search would
+    have read the link's target. Now it's reported in skipped_files
+    and the result is PARTIAL."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("SECRET_DATA\n", encoding="utf-8")
+
+    # Symlink inside root pointing outside.
+    (root / "leak.py").symlink_to(outside / "secret.py")
+    # And a regular in-root match.
+    (root / "good.py").write_text("alpha\n", encoding="utf-8")
+
+    feat = CodeFeature(agent=SimpleNamespace(features={}), code_root=str(root))
+
+    # Search for a string that exists ONLY in the symlinked secret.
+    result = await feat.code_search("SECRET_DATA")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL
+    # The secret must NOT have been matched — it lives outside the
+    # sandbox.
+    assert result.data["total_matches"] == 0
+    assert any(
+        "leak.py" in s["file"] and "symlink_escape" in s["reason"]
+        for s in result.data["skipped_files"]
+    ), f"symlink escape not skipped: {result.data['skipped_files']}"
+
+
+@pytest.mark.asyncio
+async def test_code_logs_default_skips_symlink_escape(tmp_path):
+    """Codex round-3 finding #3: code_root/kestrel.log as a symlink
+    pointing outside the sandbox must not be read."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret_log = outside / "secret.log"
+    secret_log.write_text("SECRET\n", encoding="utf-8")
+
+    # In-root path is a symlink pointing outside.
+    (root / "kestrel.log").symlink_to(secret_log)
+
+    feat = CodeFeature(agent=SimpleNamespace(features={}), code_root=str(root))
+    result = await feat.code_logs(lines=10)
+
+    assert isinstance(result, ToolResult)
+    # Either skips and finds none, or skips and continues — either
+    # way the secret content must NOT appear in the result.
+    if result.status is ToolResultStatus.OK:
+        assert "SECRET" not in result.data["content"], (
+            "symlink default-log target was read despite escaping the sandbox"
+        )
+    else:
+        assert result.status is ToolResultStatus.ERROR
+        assert "No log file found" in result.error
+
+
+@pytest.mark.asyncio
+async def test_code_restart_refuses_to_write_through_symlink_escape(tmp_path):
+    """Codex round-3 finding #4: ``.restart_requested`` as an
+    existing symlink pointing outside code_root must not be written
+    through. Pre-fix, the write would escape the sandbox."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside_target = tmp_path / "outside_target.txt"
+    outside_target.write_text("original\n", encoding="utf-8")
+
+    (root / ".restart_requested").symlink_to(outside_target)
+
+    feat = CodeFeature(agent=SimpleNamespace(features={}), code_root=str(root))
+    feat._request_approval = AsyncMock(return_value=True)
+
+    result = await feat.code_restart(reason="test")
+
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.PARTIAL
+    assert "symlink" in result.error.lower()
+    # The outside file must NOT have been overwritten.
+    assert outside_target.read_text(encoding="utf-8") == "original\n"
+
+
+@pytest.mark.asyncio
+async def test_code_read_malformed_int_args_return_failed(feature):
+    """Codex round-3 finding #5: ``start_line="x"`` would TypeError
+    on the slice. Now coerced/rejected via _coerce_optional_int and
+    lands in ToolResult.failed."""
+    feat, root = feature
+    target = root / "sample.py"
+    target.write_text("a\nb\n", encoding="utf-8")
+
+    result = await feat.code_read("sample.py", start_line="not-a-number")
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "must be an int" in result.error.lower()
+
+
+@pytest.mark.asyncio
+async def test_code_read_numeric_string_args_are_coerced(feature):
+    """Numeric strings (common from JSON tool args) are accepted."""
+    feat, root = feature
+    target = root / "sample.py"
+    target.write_text("a\nb\nc\n", encoding="utf-8")
+
+    result = await feat.code_read("sample.py", start_line="1", end_line="2")
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["shown_lines"] == 2
+
+
+@pytest.mark.asyncio
+async def test_code_edit_non_string_text_args_return_failed(feature):
+    """Codex round-3 finding #5: ``old_text=123`` would TypeError
+    out of ``content.count``. Reject with ToolResult.failed."""
+    feat, root = feature
+    target = root / "sample.py"
+    target.write_text("hello\n", encoding="utf-8")
+    result = await feat.code_edit("sample.py", old_text=123, new_text="world")
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "must be a string" in result.error.lower()
+
+
+@pytest.mark.asyncio
+async def test_code_logs_non_int_lines_returns_failed(feature):
+    """Codex round-3 finding #5: ``lines="ten"`` must not TypeError
+    out of the slice."""
+    feat, _ = feature
+    result = await feat.code_logs(lines="ten")
+    assert isinstance(result, ToolResult)
+    assert result.status is ToolResultStatus.ERROR
+    assert "must be an int" in result.error.lower()
+
+
+@pytest.mark.asyncio
 async def test_code_read_none_path_returns_failed_not_attribute_error(feature):
     """Codex round-2 finding #3: tool args can be malformed (None,
     non-str). _resolve_path now rejects them as ValueError so the

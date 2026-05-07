@@ -73,6 +73,11 @@ def _search_file_contents(
     the LLM doesn't claim a complete search when binary files,
     permission errors, or decode failures excluded part of the tree
     (#1042 honesty contract; codex round-2 finding #2).
+
+    Symlink-safe (codex round-3 finding #2): each candidate file is
+    resolved and re-checked for containment under code_root before
+    being read. A repo file ``leak.py -> /etc/passwd`` would
+    otherwise pass the search-root check but leak data on read.
     """
     matches = []
     total_matches = 0
@@ -81,6 +86,38 @@ def _search_file_contents(
     for file_path in resolved.rglob(file_pattern):
         if not file_path.is_file():
             continue
+
+        # Re-check containment after following the symlink. ``rglob``
+        # itself doesn't traverse through symlinks to directories,
+        # but it WILL list a symlinked file whose resolution escapes.
+        try:
+            real = file_path.resolve()
+            if not real.is_relative_to(code_root):
+                # Display name uses the relative path (relative to
+                # code_root) when possible; fall back to the link
+                # name if the link itself is outside (shouldn't
+                # happen since rglob is rooted in resolved, but be
+                # defensive).
+                try:
+                    display = str(file_path.relative_to(code_root))
+                except ValueError:
+                    display = str(file_path)
+                skipped.append({
+                    "file": display,
+                    "reason": "symlink_escape: target is outside code_root",
+                })
+                continue
+        except (OSError, RuntimeError, ValueError) as e:
+            try:
+                display = str(file_path.relative_to(code_root))
+            except ValueError:
+                display = str(file_path)
+            skipped.append({
+                "file": display,
+                "reason": f"resolve_failed: {e}",
+            })
+            continue
+
         try:
             content = file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError as e:
@@ -128,6 +165,67 @@ class CodeFeature(Feature):
 
     async def initialize(self):
         logger.info(f"CodeFeature initialized with root: {self.code_root}")
+
+    @staticmethod
+    def _coerce_optional_int(name: str, value: Any) -> Optional[int]:
+        """Accept None / int / str-of-digits; reject other shapes
+        with a ValueError that callers convert to ToolResult.failed
+        (codex round-3 finding #5)."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            # bool is a subclass of int but ``code_read(start_line=True)``
+            # is meaningless and almost certainly a mistake.
+            raise ValueError(
+                f"Invalid {name} '{value}': must be an int or None, "
+                f"not bool"
+            )
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            return int(value.strip())
+        raise ValueError(
+            f"Invalid {name} '{value}': must be an int, a numeric "
+            f"string, or None"
+        )
+
+    @staticmethod
+    def _coerce_required_int(name: str, value: Any, *, default: int) -> int:
+        """Like _coerce_optional_int but None falls back to the
+        default. ``code_logs(lines=None)`` is not great UX but
+        shouldn't be a hard failure."""
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            raise ValueError(
+                f"Invalid {name} '{value}': must be an int, not bool"
+            )
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            return int(value.strip())
+        raise ValueError(
+            f"Invalid {name} '{value}': must be an int or numeric "
+            f"string"
+        )
+
+    def _is_inside_root(self, path: Path) -> bool:
+        """Resolve ``path`` (following symlinks) and check
+        ``is_relative_to(code_root)``. Used by tool methods that
+        traverse the tree (code_search via rglob, code_logs default
+        fallbacks, code_restart writing .restart_requested) to
+        re-check containment AFTER following symlinks.
+
+        Without this, a symlink ``leak.py -> /etc/passwd`` planted
+        in the repo would pass the entry-level _resolve_path check
+        and then leak data when the tool reads through it (codex
+        round-3 findings #2, #3, #4).
+        """
+        try:
+            resolved = path.resolve()
+            return resolved.is_relative_to(self.code_root)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
 
     def _resolve_path(self, path: str) -> Path:
         """Resolve a path relative to code root, with security checks.
@@ -207,6 +305,18 @@ class CodeFeature(Feature):
         start_line: int = None,
         end_line: int = None,
     ) -> ToolResult:
+        # Coerce optional int args BEFORE doing anything else so a
+        # malformed ``start_line="x"`` lands in ToolResult.failed
+        # instead of TypeError-ing out of the slice (codex round-3
+        # finding #5).
+        try:
+            start_line = self._coerce_optional_int(
+                "start_line", start_line
+            )
+            end_line = self._coerce_optional_int("end_line", end_line)
+        except ValueError as e:
+            return ToolResult.failed(str(e), data={"path": path})
+
         try:
             resolved = self._resolve_path(path)
         except ValueError as e:
@@ -330,6 +440,17 @@ class CodeFeature(Feature):
         new_text: str,
         description: str = None,
     ) -> ToolResult:
+        # Validate text args are strings (codex round-3 finding #5).
+        # ``old_text=123`` would TypeError out of ``content.count``
+        # otherwise.
+        for arg_name, arg_val in (("old_text", old_text), ("new_text", new_text)):
+            if not isinstance(arg_val, str):
+                return ToolResult.failed(
+                    f"Invalid {arg_name}: must be a string, got "
+                    f"{type(arg_val).__name__}",
+                    data={"path": path, "arg": arg_name},
+                )
+
         try:
             resolved = self._resolve_path(path)
         except ValueError as e:
@@ -614,6 +735,24 @@ class CodeFeature(Feature):
         try:
             self._pending_restart = True
             restart_file = self.code_root / ".restart_requested"
+            # Re-check containment AFTER symlink resolution (codex
+            # round-3 finding #4). If ``.restart_requested`` is a
+            # pre-existing symlink to a file outside code_root,
+            # writing through it would escape the sandbox.
+            if restart_file.exists() and not self._is_inside_root(restart_file):
+                return ToolResult.partial(
+                    confirmation="Restart approved (in-memory flag set)",
+                    error=(
+                        ".restart_requested exists as a symlink pointing "
+                        "outside code_root; refusing to write through it"
+                    ),
+                    data={
+                        "pending_restart": True,
+                        "warning": (
+                            "external process managers may not see the signal"
+                        ),
+                    },
+                )
             await _write_text(restart_file, reason or "Code changes applied")
         except Exception as e:
             return ToolResult.partial(
@@ -811,6 +950,22 @@ class CodeFeature(Feature):
         errors_only: bool = False,
         log_file: str = None,
     ) -> ToolResult:
+        # Coerce ``lines`` and ``errors_only`` (codex round-3 finding
+        # #5): a malformed ``lines="10"`` would TypeError out of the
+        # ``log_lines[-lines:]`` slice; ``errors_only="true"``
+        # (string) is truthy and would silently filter unintended
+        # results.
+        try:
+            lines = self._coerce_required_int("lines", lines, default=50)
+        except ValueError as e:
+            return ToolResult.failed(str(e), data={"lines": lines})
+        if not isinstance(errors_only, bool):
+            return ToolResult.failed(
+                f"Invalid errors_only: must be a bool, got "
+                f"{type(errors_only).__name__}",
+                data={"errors_only": errors_only},
+            )
+
         # User-supplied ``log_file`` MUST go through _resolve_path —
         # without it, a relative escape like ``../../../etc/passwd``
         # would read outside the code-root sandbox.
@@ -839,10 +994,18 @@ class CodeFeature(Feature):
             for p in log_paths:
                 if p is None:
                     continue
-                if p.exists():
-                    log_content = await _read_text(p)
-                    used_path = str(p)
-                    break
+                if not p.exists():
+                    continue
+                # Re-check containment after symlink resolution
+                # (codex round-3 finding #3). The default fallbacks
+                # construct paths from ``code_root / "kestrel.log"``
+                # which look fine syntactically but could be
+                # symlinks pointing outside the sandbox.
+                if not self._is_inside_root(p):
+                    continue
+                log_content = await _read_text(p)
+                used_path = str(p)
+                break
         except Exception as e:
             return ToolResult.failed(str(e))
 
@@ -888,15 +1051,25 @@ class CodeFeature(Feature):
         # ``commit="--hard"`` becomes ``git reset --hard``, which
         # discards the working tree even though the approval payload
         # said ``"hard": false``. The confirmation would also lie:
-        # "Rolled back to --hard". A leading ``-`` is the simple
-        # check; alternatively we could rev-parse --verify the ref
-        # before reset, but the leading-hyphen ban is sufficient for
-        # the injection class and faster.
+        # "Rolled back to --hard".
         if not isinstance(commit, str) or commit.startswith("-"):
             return ToolResult.failed(
                 f"Invalid commit ref '{commit}': must not start with '-' "
                 f"(possible git-option injection)",
                 data={"commit": commit, "hard": hard},
+            )
+
+        # Validate ``hard`` is an actual bool (codex round-3 finding
+        # #1). A string like ``"false"`` is truthy in Python, so
+        # without this check ``hard="false"`` would run ``git reset
+        # --hard`` even though the approval payload preserved the
+        # string verbatim. This is a confirmation/approval mismatch
+        # AND a destructive security issue.
+        if not isinstance(hard, bool):
+            return ToolResult.failed(
+                f"Invalid hard '{hard}': must be a real bool, not "
+                f"{type(hard).__name__}",
+                data={"commit": commit, "hard": hard, "hard_type": type(hard).__name__},
             )
 
         try:
