@@ -35,7 +35,7 @@ The feature is auto-discovered by Kestrel Sovereign via the `kestrel_sovereign.f
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.4,<1` — base `Feature`, `tool`, `ToolCategory`, `ToolResult`
+- `kestrel-sovereign-sdk>=0.14.1,<1` — base `Feature`, `tool`, `ToolCategory`, `ToolResult`
 
 No runtime dependency on `kestrel-sovereign` itself; the feature operates against any codebase via `KESTREL_CODE_ROOT`.
 
